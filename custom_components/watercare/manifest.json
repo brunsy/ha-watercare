@@ -1,0 +1,16 @@
+{
+	"domain": "watercare",
+	"name": "Watercare",
+	"codeowners": [
+		"@brunsy"
+	],
+	"config_flow": true,
+	"dependencies": [
+		"recorder"
+	],
+	"documentation": "https://github.com/brunsy/ha-watercare",
+	"iot_class": "cloud_polling",
+	"issue_tracker": "https://github.com/brunsy/ha-watercare/issues",
+	"requirements": [],
+	"version": "0.0.1"
+}

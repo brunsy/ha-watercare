@@ -1,0 +1,10 @@
+{
+	"name": "Watercare",
+	"country": [
+		"NZ"
+	],
+	"filename": "watercare.zip",
+	"hide_default_branch": true,
+	"render_readme": true,
+	"zip_release": true
+}
