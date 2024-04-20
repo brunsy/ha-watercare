@@ -14,7 +14,7 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_CLIENT_ID, CONF_TOKEN
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.components.sensor import SensorEntity
 
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -42,7 +42,7 @@ If you have any issues with this you need to open an issue here:
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_CLIENT_ID): cv.string, vol.Required(CONF_TOKEN): cv.string}
+    {vol.Required(CONF_EMAIL): cv.string, vol.Required(CONF_PASSWORD): cv.string}
 )
 
 SCAN_INTERVAL = timedelta(hours=12)
@@ -55,10 +55,10 @@ async def async_setup_entry(
     discovery_info=None,
 ):
     """Asynchronously set-up the entry."""
-    client_id = entry.data.get(CONF_CLIENT_ID)
-    refresh_token = entry.data.get(CONF_TOKEN)
+    email = entry.data.get(CONF_EMAIL)
+    password = entry.data.get(CONF_PASSWORD)
 
-    api = WatercareApi(client_id, refresh_token)
+    api = WatercareApi(email, password)
 
     _LOGGER.debug("Setting up sensor(s)...")
 
@@ -108,8 +108,10 @@ class WatercareUsageSensor(SensorEntity):
         """Update the sensor data."""
         _LOGGER.debug("Beginning usage update")
 
-        # Ensure that you await the coroutine functions here
-        await self._api.token()
+		# TODO sort out token refresh rates 
+        await self._api.get_refresh_token()
+        # await self._api.token()
+
         response = await self._api.get_data(endpoint="dailywithstats")
         await self.process_daily_data(response)
 
