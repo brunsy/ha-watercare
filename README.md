@@ -32,7 +32,8 @@ Copy all files in the custom*components/watercare folder to your Home Assistant 
 
 Your support is welcomed.
 
-- Implement logic around refreshing user tokens
+- fix/add labels for user integration config flow
+- add sensor for half hourly data
 - Support for watercare rates (they only give us the monthly billing info, so will probably need to be set-up manually)
 
 ## Acknowledgements

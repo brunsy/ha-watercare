@@ -1,7 +1,7 @@
 import aiohttp
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Mapping, Any
 import json
 import re
@@ -29,7 +29,7 @@ class WatercareApi:
         self._client_id = "799c26af-c35b-4010-bd04-b6a7ebdba811"
         self._redirect_uri = 'msauth://nz.co.watercare/yRDm0vmCd9zdnwt1eCLGp8KfdLY%3D', #registered redirect URI for the client ID
         self._url_base = "https://customerapp.api.water.co.nz/"
-        self._url_token_base = "https://wslpwb2cprd.b2clogin.com/tfp/wslpwb2cprd.onmicrosoft.com/"
+        self._url_token_base = "https://wslpwb2cprd.b2clogin.com/tfp/wslpwb2cprd.onmicrosoft.com"
         self._p = "B2C_1_sign_up_or_sign_in_mobile"
 
         self._email = email
@@ -38,13 +38,14 @@ class WatercareApi:
         self._accountNumber = None
         self._token = None
         self._refresh_token = None
+        self._refresh_token_expires_in = 0
+        self._access_token_expires_in = 0
         
     def get_setting_json(self, page: str) -> Mapping[str, Any] | None:
         for line in page.splitlines():
             if line.startswith("var SETTINGS = ") and line.endswith(";"):
                 # Remove the prefix and suffix to get valid JSON
                 json_string = line.removeprefix("var SETTINGS = ").removesuffix(";")
-                # Parse the JSON string
                 return json.loads(json_string)
         return None
 
@@ -59,8 +60,8 @@ class WatercareApi:
 
     async def get_refresh_token(self):
         """Get the refresh token."""
+        _LOGGER.debug(f"API get_refresh_token")
         async with aiohttp.ClientSession() as session:
-            # Define the URL
             url = f"{self._url_token_base}/{self._p}/oAuth2/v2.0/authorize"
 
             code_verifier = self.generate_code_verifier()
@@ -68,7 +69,6 @@ class WatercareApi:
             client_request_id = str(uuid.uuid4())
             scope = f'{self._client_id} openid offline_access profile'
 
-            # Define query parameters
             params = {
                 'response_type': 'code',
                 'code_challenge_method': 'S256',
@@ -80,13 +80,9 @@ class WatercareApi:
                 'code_challenge': code_challenge
             }
             
-            # Make the request
             async with session.get(url, params=params) as response:
                 response_text = await response.text()
 
-            _LOGGER.debug(f"response_text: {response_text}")
-
-            # Parse SETTINGS JSON from the response HTML
             settings_json = self.get_setting_json(response_text)
             _LOGGER.debug(f"settings_json: {settings_json}")
 
@@ -106,7 +102,7 @@ class WatercareApi:
             }
 
             async with session.post(url, headers=headers, data=payload) as response:
-                pass  # Handle the response as needed
+                pass 
 
             url = f"{self._url_token_base}/{self._p}/api/CombinedSigninAndSignup/confirmed"
             params = {
@@ -127,7 +123,6 @@ class WatercareApi:
                     error_description = query_params['error_description'][0]
                     _LOGGER.error("Error description in response: %s", error_description)
 
-            _LOGGER.debug(f"query_params: {query_params}")
             code = query_params['code'][0]
 
             url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
@@ -146,26 +141,28 @@ class WatercareApi:
                 response_data = await response.json()
                 refresh_token = response_data.get('refresh_token')
                 access_token = response_data.get('access_token')
+                refresh_token_expires_in = response_data.get('refresh_token_expires_in')
+                access_token_expires_in = response_data.get('expires_in')
 
             self._token = access_token
-            self._refresh_token = access_token
-            _LOGGER.debug("Refresh token retrieved successfully.")
+            self._refresh_token = refresh_token
+            self._refresh_token_expires_in = refresh_token_expires_in
+            self._access_token_expires_in = access_token_expires_in
+            _LOGGER.debug(f"Refresh token retrieved successfully.", {self._refresh_token})
             await self.get_accounts()
 
 
-    async def token(self):
+    async def get_api_token(self):
         """Get token from the Watercare API."""
         token_data = {
             "grant_type": "refresh_token",
             "client_id": self._client_id,
             "refresh_token": self._refresh_token,
         }
-
+		
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                self._url_token_base + self._p + "/oAuth2/v2.0/token",
-                data=token_data
-            ) as response:
+            url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
+            async with session.post(url, data=token_data) as response:
                 if response.status == 200:
                     jsonResult = await response.json()
                     self._token = jsonResult["access_token"]
@@ -203,12 +200,20 @@ class WatercareApi:
         """Get data from the API."""
         if endpoint not in ["dailywithstats", "halfhourly"]:
             raise ValueError("Invalid endpoint. Must be 'dailywithstats' or 'halfhourly'.")
-        
+          
         today = datetime.now()
         seven_days_ago = today - timedelta(days=7)
+
+        if datetime.fromtimestamp(self._access_token_expires_in) <= today + timedelta(minutes=5):
+            _LOGGER.debug("Access token needs renewing")
+            await self.get_api_token()
+            
+        if datetime.fromtimestamp(self._refresh_token_expires_in) <= today + timedelta(hours=1):
+            _LOGGER.debug("Refresh token needs renewing")
+            await self.get_refresh_token()
+
         headers = {"authorization":  "Bearer " + self._token}
 
-        _LOGGER.debug(f"_url_base: {self._url_base}")
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 self._url_base
