@@ -6,14 +6,16 @@ View your water useage.
 
 Sensor shows yesterdays water usage, but since the API exposes the current half hourly water usage this can be added in future
 
+![Water Useage PNG](/homeassistant-water-graph.png "Energy Dashboard Reporting")
+
 ## Getting started
 
-You will need to have an existing Watercare account and a watercare smart meter installed.
-username/password is not yet implemented so currently you will need to intercept both the client_id and refresh_token from the watercare app to use this integration.
+You will need to have an existing Watercare account and a Watercare smart meter installed for the hourly reporting.
 
 ## Installation
 
-Once installed, simply set-up from the `Devices and services` area. The first field is client_id and the next field is refresh_token for your account.
+Once installed, simply set-up from the `Devices and services` area.
+The first field is the username and the next field is the password for your Watercare account.
 
 ### HACS (recommended)
 
@@ -33,7 +35,6 @@ Copy all files in the custom*components/watercare folder to your Home Assistant 
 Your support is welcomed.
 
 - fix/add labels for user integration config flow
-- add sensor for half hourly data
 - Support for watercare rates (they only give us the monthly billing info, so will probably need to be set-up manually)
 
 ## Acknowledgements

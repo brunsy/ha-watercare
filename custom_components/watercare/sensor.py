@@ -41,7 +41,10 @@ class WatercareUsageSensor(SensorEntity):
         self._name = name
         self._icon = "mdi:water"
         self._state = None
+        self._unit_of_measurement = "L"
         self._unique_id = DOMAIN
+        self._device_class = "water"
+        self._state_class = "total"
         self._state_attributes = {}
         self._api = api
 
@@ -66,6 +69,21 @@ class WatercareUsageSensor(SensorEntity):
         return self._state_attributes
 
     @property
+    def unit_of_measurement(self):
+        """Return the unit of measurement."""
+        return self._unit_of_measurement
+
+    @property
+    def state_class(self):
+        """Return the state class."""
+        return self._state_class
+
+    @property
+    def device_class(self):
+        """Return the device class."""
+        return self._device_class
+
+    @property
     def unique_id(self):
         """Return the unique id."""
         return self._unique_id
@@ -73,8 +91,68 @@ class WatercareUsageSensor(SensorEntity):
     async def async_update(self):
         """Update the sensor data."""
         _LOGGER.debug("Beginning sensor update")
-        response = await self._api.get_data(endpoint="dailywithstats")
-        await self.process_daily_data(response)
+        response = await self._api.get_data(endpoint="halfhourly")
+        await self.process_data(response)
+
+
+    async def process_data(self, response):
+        """Process the half hourly data."""
+        parsed_data = json.loads(response)
+        _LOGGER.debug(f"Parsed data: {parsed_data}")
+        usage_data = parsed_data
+
+        litresRunningSum = 0
+        daily_consumption = {}
+		
+        hourly_consumption = {}
+        
+		# HASSIO stats needs hourly data not half hourly
+        for entry in usage_data:
+            timestamp_str = entry.get("timestamp")
+            litres = entry.get("litres", 0)
+
+            hourly_timestamp = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fz").replace(minute=0, second=0, microsecond=0).replace(tzinfo=pytz.utc)
+            hourly_timestamp_str = hourly_timestamp.strftime("%Y-%m-%dT%H")
+            hourly_consumption.setdefault(hourly_timestamp_str, {'litres': 0, 'hourly_timestamp': hourly_timestamp})
+            
+            hourly_consumption[hourly_timestamp_str]['litres'] += litres
+            hourly_consumption[hourly_timestamp_str]['hourly_timestamp'] = hourly_timestamp
+
+        hour_statistics = []
+        first=True
+        for hour, data in hourly_consumption.items():
+            start = data['hourly_timestamp']
+            
+			# HASSIO statistics requires us to add values as a sum of all previous values.
+            litresRunningSum += data['litres']
+
+            if first:
+                reset = start
+                first=False
+
+            statistic_data = {
+                "start": start,
+                "sum": litresRunningSum,
+                "last_reset": reset,
+            }
+            hour_statistics.append(StatisticData(statistic_data))
+
+        sensor_type = "consumption"
+        if hour_statistics:
+            day_metadata = StatisticMetaData(
+                has_mean= False,
+                has_sum= True,
+                name= f"{DOMAIN} {sensor_type}",
+                source= DOMAIN,
+                statistic_id= f"{DOMAIN}:{sensor_type}",
+                unit_of_measurement= self._unit_of_measurement,
+			)
+
+            _LOGGER.debug(f"Day statistics: {hour_statistics}")
+            async_add_external_statistics(self.hass, day_metadata, hour_statistics)
+        else:
+            _LOGGER.warning("No day statistics found, skipping update")
+
 
     async def process_daily_data(self, response):
         """Process the daily data."""
@@ -83,6 +161,7 @@ class WatercareUsageSensor(SensorEntity):
         usage_data = parsed_data.get("usage", [])
         statistic_data = parsed_data.get("statistics", {})
 
+        litresRunningSum = 0
         daily_consumption = {}
         nz_timezone = pytz.timezone("Pacific/Auckland")
 
@@ -110,15 +189,25 @@ class WatercareUsageSensor(SensorEntity):
             "currentHouseholdBand": efficiency_data.get('currentHouseholdBand'),
             "usageToLowerBand": efficiency_data.get('usageToLowerBand'),
         })
-
+        
         day_statistics = []
+        first=True
         for date, litres in daily_consumption.items():
             start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=nz_timezone)
-                        
+            
+			# HASSIO statistics requires us to add values as a sum of all previous values.
+            litresRunningSum += litres
+
+            if first:
+                reset = start
+                first=False
+
             statistic_data = {
                 "start": start,
-                "sum": litres
+                "sum": litresRunningSum,
+                "last_reset": reset,
             }
+            
             day_statistics.append(StatisticData(statistic_data))
 
         sensor_type = "consumption_daily"
@@ -129,7 +218,7 @@ class WatercareUsageSensor(SensorEntity):
                 name= f"{DOMAIN} {sensor_type}",
                 source= DOMAIN,
                 statistic_id= f"{DOMAIN}:{sensor_type}",
-                unit_of_measurement= "L",
+                unit_of_measurement= self._unit_of_measurement,
 			)
 
             _LOGGER.debug(f"Day statistics: {day_statistics}")
