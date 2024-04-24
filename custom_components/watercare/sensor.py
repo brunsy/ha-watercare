@@ -1,20 +1,17 @@
 """Watercare sensors."""
 
 from datetime import datetime, timedelta
-import asyncio
 import logging
 import json
 import pytz
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_add_external_statistics
 
-from .api import WatercareApi
 from .const import DOMAIN, SENSOR_NAME
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,7 +22,7 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback, discovery_info=None
 ):
     """Set up the Watercare sensor platform."""
-    
+
     if "api" not in hass.data[DOMAIN]:
         _LOGGER.error("API instance not found in config entry data.")
         return False
@@ -102,11 +99,9 @@ class WatercareUsageSensor(SensorEntity):
         usage_data = parsed_data
 
         litresRunningSum = 0
-        daily_consumption = {}
-		
         hourly_consumption = {}
-        
-		# HASSIO stats needs hourly data not half hourly
+
+        # HASSIO stats needs hourly data not half hourly
         for entry in usage_data:
             timestamp_str = entry.get("timestamp")
             litres = entry.get("litres", 0)
@@ -114,16 +109,16 @@ class WatercareUsageSensor(SensorEntity):
             hourly_timestamp = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fz").replace(minute=0, second=0, microsecond=0).replace(tzinfo=pytz.utc)
             hourly_timestamp_str = hourly_timestamp.strftime("%Y-%m-%dT%H")
             hourly_consumption.setdefault(hourly_timestamp_str, {'litres': 0, 'hourly_timestamp': hourly_timestamp})
-            
+
             hourly_consumption[hourly_timestamp_str]['litres'] += litres
             hourly_consumption[hourly_timestamp_str]['hourly_timestamp'] = hourly_timestamp
 
         hour_statistics = []
         first=True
-        for hour, data in hourly_consumption.items():
+        for _hour, data in hourly_consumption.items():
             start = data['hourly_timestamp']
-            
-			# HASSIO statistics requires us to add values as a sum of all previous values.
+
+            # HASSIO statistics requires us to add values as a sum of all previous values.
             litresRunningSum += data['litres']
 
             if first:
@@ -146,7 +141,7 @@ class WatercareUsageSensor(SensorEntity):
                 source= DOMAIN,
                 statistic_id= f"{DOMAIN}:{sensor_type}",
                 unit_of_measurement= self._unit_of_measurement,
-			)
+            )
 
             _LOGGER.debug(f"Day statistics: {hour_statistics}")
             async_add_external_statistics(self.hass, day_metadata, hour_statistics)
@@ -189,13 +184,13 @@ class WatercareUsageSensor(SensorEntity):
             "currentHouseholdBand": efficiency_data.get('currentHouseholdBand'),
             "usageToLowerBand": efficiency_data.get('usageToLowerBand'),
         })
-        
+
         day_statistics = []
         first=True
         for date, litres in daily_consumption.items():
             start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=nz_timezone)
-            
-			# HASSIO statistics requires us to add values as a sum of all previous values.
+
+            # HASSIO statistics requires us to add values as a sum of all previous values.
             litresRunningSum += litres
 
             if first:
@@ -207,7 +202,7 @@ class WatercareUsageSensor(SensorEntity):
                 "sum": litresRunningSum,
                 "last_reset": reset,
             }
-            
+
             day_statistics.append(StatisticData(statistic_data))
 
         sensor_type = "consumption_daily"
@@ -219,7 +214,7 @@ class WatercareUsageSensor(SensorEntity):
                 source= DOMAIN,
                 statistic_id= f"{DOMAIN}:{sensor_type}",
                 unit_of_measurement= self._unit_of_measurement,
-			)
+            )
 
             _LOGGER.debug(f"Day statistics: {day_statistics}")
             async_add_external_statistics(self.hass, day_metadata, day_statistics)

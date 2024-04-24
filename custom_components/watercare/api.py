@@ -1,15 +1,15 @@
+"""Watercare API."""
+
 import aiohttp
 import logging
-import requests
-from datetime import datetime, timedelta, timezone
-from typing import Mapping, Any
+from datetime import datetime, timedelta
+from typing import Any
+from collections.abc import Mapping
 import json
-import re
 import secrets
 import hashlib
 import base64
 import uuid
-import http.client
 from urllib.parse import parse_qs
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,14 +34,15 @@ class WatercareApi:
 
         self._email = email
         self._password = password
-        
+
         self._accountNumber = None
         self._token = None
         self._refresh_token = None
         self._refresh_token_expires_in = 0
         self._access_token_expires_in = 0
-        
+
     def get_setting_json(self, page: str) -> Mapping[str, Any] | None:
+        """Get the settings from json result."""
         for line in page.splitlines():
             if line.startswith("var SETTINGS = ") and line.endswith(";"):
                 # Remove the prefix and suffix to get valid JSON
@@ -50,17 +51,19 @@ class WatercareApi:
         return None
 
     def generate_code_verifier(self):
+        """Generate code verifier for OAuth steps."""
         code_verifier = secrets.token_urlsafe(100)
         return code_verifier[:128]  # Trim to a maximum length of 128 characters
 
     def generate_code_challenge(self, code_verifier):
+        """Generate code challenge for OAuth steps."""
         code_challenge = hashlib.sha256(code_verifier.encode()).digest()
         code_challenge_base64 = base64.urlsafe_b64encode(code_challenge).rstrip(b'=').decode()
         return code_challenge_base64
 
     async def get_refresh_token(self):
         """Get the refresh token."""
-        _LOGGER.debug(f"API get_refresh_token")
+        _LOGGER.debug("API get_refresh_token")
         async with aiohttp.ClientSession() as session:
             url = f"{self._url_token_base}/{self._p}/oAuth2/v2.0/authorize"
 
@@ -79,7 +82,7 @@ class WatercareApi:
                 'redirect_uri': self._redirect_uri,
                 'code_challenge': code_challenge
             }
-            
+
             async with session.get(url, params=params) as response:
                 response_text = await response.text()
 
@@ -102,7 +105,7 @@ class WatercareApi:
             }
 
             async with session.post(url, headers=headers, data=payload) as response:
-                pass 
+                pass
 
             url = f"{self._url_token_base}/{self._p}/api/CombinedSigninAndSignup/confirmed"
             params = {
@@ -148,7 +151,7 @@ class WatercareApi:
             self._refresh_token = refresh_token
             self._refresh_token_expires_in = refresh_token_expires_in
             self._access_token_expires_in = access_token_expires_in
-            _LOGGER.debug(f"Refresh token retrieved successfully.", {self._refresh_token})
+            _LOGGER.debug("Refresh token retrieved successfully.", {self._refresh_token})
             await self.get_accounts()
 
 
@@ -159,7 +162,7 @@ class WatercareApi:
             "client_id": self._client_id,
             "refresh_token": self._refresh_token,
         }
-		
+
         async with aiohttp.ClientSession() as session:
             url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
             async with session.post(url, data=token_data) as response:
@@ -174,64 +177,56 @@ class WatercareApi:
     async def get_accounts(self):
         """Get the first account that we see."""
         headers = {"authorization":  "Bearer " + self._token}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                self._url_base + "v1/account",
-                headers=headers
-            ) as result:
-                if result.status == 200:
-                    _LOGGER.debug("Retrieved accounts")
-                    data = await result.json()
-                    _LOGGER.debug(f"Accounts : {data}")
-                    if data and isinstance(data, list) and len(data) > 0:
-                        first_account = data[0]
-                        account_number = first_account.get("accountNumber")
-                        if account_number is not None:
-                            _LOGGER.debug(f"AccountNumber: {account_number}")
-                            self._accountNumber = account_number
-                        else:
-                            _LOGGER.error("Account number not found in the response")
+        async with aiohttp.ClientSession() as session, session.get(
+            self._url_base + "v1/account",
+            headers=headers
+        ) as result:
+            if result.status == 200:
+                _LOGGER.debug("Retrieved accounts")
+                data = await result.json()
+                _LOGGER.debug(f"Accounts : {data}")
+                if data and isinstance(data, list) and len(data) > 0:
+                    first_account = data[0]
+                    account_number = first_account.get("accountNumber")
+                    if account_number is not None:
+                        _LOGGER.debug(f"AccountNumber: {account_number}")
+                        self._accountNumber = account_number
                     else:
-                        _LOGGER.error("No accounts found in the response")
+                        _LOGGER.error("Account number not found in the response")
                 else:
-                    _LOGGER.error("Failed to fetch customer accounts %s", await result.text())
+                    _LOGGER.error("No accounts found in the response")
+            else:
+                _LOGGER.error("Failed to fetch customer accounts %s", await result.text())
 
     async def get_data(self, endpoint: str):
         """Get data from the API."""
         if endpoint not in ["dailywithstats", "halfhourly"]:
             raise ValueError("Invalid endpoint. Must be 'dailywithstats' or 'halfhourly'.")
-          
-        today = datetime.now()
-        seven_days_ago = today - timedelta(days=7)
 
-        if datetime.fromtimestamp(self._access_token_expires_in) <= today + timedelta(minutes=5):
+        if datetime.fromtimestamp(self._access_token_expires_in) <= datetime.now() + timedelta(minutes=5):
             _LOGGER.debug("Access token needs renewing")
             await self.get_api_token()
-            
-        if datetime.fromtimestamp(self._refresh_token_expires_in) <= today + timedelta(hours=1):
+
+        if datetime.fromtimestamp(self._refresh_token_expires_in) <= datetime.now() + timedelta(hours=1):
             _LOGGER.debug("Refresh token needs renewing")
             await self.get_refresh_token()
 
         headers = {"authorization":  "Bearer " + self._token}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                self._url_base
-                + "v1/usage/"
-                + self._accountNumber
-                + f"/{endpoint}?from="
-                + seven_days_ago.strftime("%Y-%m-%dT")+ "00:00:00Z"
-                + "&to="
-                + today.strftime("%Y-%m-%dT")+ "00:00:00Z",
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    data = await response.text()
-                    if not data:
-                        _LOGGER.warning(
-                            "Fetched consumption successfully but there was no data"
-                        )
-                    return data
-                else:
-                    _LOGGER.error("Could not fetch consumption")
-                    return None
+        today = datetime.now()
+        seven_days_ago = today - timedelta(days=7) # fetch 7 days worth of data
+        from_date = seven_days_ago.strftime("%Y-%m-%d") + "T00:00:00Z"
+        to_date = today.strftime("%Y-%m-%d") + "T00:00:00Z"
+
+        url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}?from={from_date}&to={to_date}"
+
+        async with aiohttp.ClientSession() as session, \
+                session.get(url, headers=headers) as response:
+            if response.status == 200:
+                data = await response.text()
+                if not data:
+                    _LOGGER.warning("Fetched consumption successfully but there was no data")
+                return data
+            else:
+                _LOGGER.error("Could not fetch consumption")
+                return None
