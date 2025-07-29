@@ -1,39 +1,44 @@
-"""Support for Watercare Energy sensors."""
-
+"""Watercare custom integration."""
+import asyncio
 import logging
+from datetime import timedelta
 
-from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN, PLATFORMS
+from .const import DOMAIN
 from .api import WatercareApi
 
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS = [Platform.SENSOR]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up from a config entry."""
-    email = entry.data.get("email")
+    """Set up Watercare from a config entry."""
+    
+    # Handle both old (email) and new (username) config formats
+    email = entry.data.get("username") or entry.data.get("email")
     password = entry.data.get("password")
-
+    
+    if not email or not password:
+        _LOGGER.error("Missing username/email or password in config entry")
+        return False
+    
     api = WatercareApi(email, password)
-
-    await api.get_refresh_token()
-
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-
+    
+    hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["api"] = api
-
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-
+    
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, ["sensor"])
-
-async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data[DOMAIN].pop("api")
+    
+    return unload_ok
