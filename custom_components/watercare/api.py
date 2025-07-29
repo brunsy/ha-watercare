@@ -176,36 +176,35 @@ class WatercareApi:
                 else:
                     _LOGGER.error("Failed to fetch customer accounts %s", await result.text())
 
-    async def get_data(self, endpoint: str):
+    async def get_data(self, endpoint: str, start_date: str = None, end_date: str = None):
         """Get data from the API."""
-        if endpoint not in ["dailywithstats", "halfhourly"]:
-            raise ValueError("Invalid endpoint. Must be 'dailywithstats' or 'halfhourly'.")
+        if endpoint not in ["halfhourly", "dailywithstats", "monthly", "mechanicalmonthly"]:
+            raise ValueError("Invalid endpoint specified")
 
-        if datetime.fromtimestamp(self._access_token_expires_in) <= datetime.now() + timedelta(minutes=5):
-            _LOGGER.debug("Access token needs renewing")
-            await self.get_api_token()
-
-        if datetime.fromtimestamp(self._refresh_token_expires_in) <= datetime.now() + timedelta(hours=1):
-            _LOGGER.debug("Refresh token needs renewing")
+        # If no account number, need to authenticate first
+        if not self._accountNumber:
+            _LOGGER.debug("No account number found, starting authentication process")
             await self.get_refresh_token()
+            if not self._accountNumber:
+                _LOGGER.error("Authentication failed - no account number obtained")
+                return None
 
         headers = {"authorization": "Bearer " + (self._token or "")}
 
-        today = datetime.now()
-        seven_days_ago = today - timedelta(days=7)
-        from_date = seven_days_ago.strftime("%Y-%m-%d") + "T00:00:00Z"
-        to_date = today.strftime("%Y-%m-%d") + "T00:00:00Z"
+        url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
+        if start_date and end_date:
+            url += f"?startDate={start_date}&endDate={end_date}"
 
-        url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}?from={from_date}&to={to_date}"
-
+        _LOGGER.debug(f"Calling API URL: {url}")
+        
         jar = aiohttp.CookieJar(quote_cookie=False)
         async with aiohttp.ClientSession(cookie_jar=jar) as session:
             async with session.get(url, headers=headers) as response:
                 if response.status == 200:
                     data = await response.text()
-                    if not data:
-                        _LOGGER.warning("Fetched consumption successfully but there was no data")
+                    _LOGGER.debug(f"API Response status: {response.status}")
+                    _LOGGER.debug(f"API Response data length: {len(data) if data else 0}")
                     return data
                 else:
-                    _LOGGER.error("Could not fetch consumption")
+                    _LOGGER.error(f"Could not fetch consumption: {response.status}")
                     return None

@@ -1,21 +1,61 @@
 # Watercare integration for Home Assistant
 
-View your water useage.
+Monitor your water consumption and costs with detailed usage tracking, cost calculations, and Energy Dashboard integration.
 
-## Data
+## Data Source Options
 
-Sensor shows yesterdays water usage, but since the API exposes the current half hourly water usage this can be added in future
+Choose the appropriate data source based on your meter type:
 
-![Water Useage PNG](/homeassistant-water-graph.png "Energy Dashboard Reporting")
+### Non-Smart Meters
+- **Monthly Billing Periods** (Default) - Shows billing period summaries from meter readings
+
+### Smart Meters  
+- **Daily Usage with Statistics** - Daily consumption with efficiency comparisons
+- **Monthly Usage** - Monthly usage totals for trend analysis
+- **Half-hourly Usage** - Detailed consumption data updated every 30 minutes
+
+Most users with traditional meters should use the default option. Smart meter users can choose based on their preferred level of detail.
+
+![Smart Meter Water Usage in Energy Dashboard](/homeassistant-water-graph.png "Energy Dashboard Reporting")
+![Mechanical Meter Water Usage in Energy Dashboard](/homeassistant-water-graph-mechanicalmonthly.png "Energy Dashboard Reporting")
 
 ## Getting started
 
-You will need to have an existing Watercare account and a Watercare smart meter installed for the hourly reporting.
+You will need an existing Watercare account. Smart meter users have access to detailed hourly and daily reporting, while traditional meter users can view monthly billing period summaries.
+
+## Features
+
+- **Multiple Data Sources**: Support for both smart and non-smart meters with different reporting frequencies
+- **Cost Calculations**: Automatic cost calculations with configurable consumption and wastewater rates
+- **Energy Dashboard Integration**: Seamless integration with Home Assistant's Energy Dashboard
+- **Historical Statistics**: Generates long-term statistics for consumption and cost tracking
+- **Efficiency Monitoring**: Smart meter users get household efficiency comparisons and usage insights
 
 ## Installation
 
-Once installed, simply set-up from the `Devices and services` area.
-The first field is the username and the next field is the password for your Watercare account.
+Once installed, set up from the `Devices and services` area with the following configuration:
+
+### Required Configuration
+- **Username**: Your Watercare account username
+- **Password**: Your Watercare account password
+
+### Optional Configuration
+- **Data Source**: Choose the appropriate endpoint for your meter type (see Data Source Options above)
+- **Consumption Rate**: Cost per 1000L for water consumption (default: $2.296 NZD)
+- **Wastewater Rate**: Cost per 1000L for wastewater processing (default: $3.994 NZD)
+
+The rates can be configured during initial setup or modified later through the integration's options.
+
+## Energy Dashboard Integration
+
+This integration automatically creates statistics compatible with Home Assistant's Energy Dashboard:
+
+- **Water Consumption**: Tracks total water usage over time
+- **Water Costs**: Calculates and tracks total water costs
+- **Consumption Costs**: Separate tracking of water consumption charges
+- **Wastewater Costs**: Separate tracking of wastewater processing charges
+
+The statistics are automatically generated and will appear in your Energy Dashboard's water section for long-term monitoring and analysis.
 
 ### HACS (recommended)
 
@@ -34,8 +74,10 @@ Copy all files in the custom*components/watercare folder to your Home Assistant 
 
 Your support is welcomed.
 
-- fix/add labels for user integration config flow
-- Support for watercare rates (they only give us the monthly billing info, so will probably need to be set-up manually)
+- Enhanced configuration flow labels and descriptions
+- Additional cost analysis features
+- Support for multiple properties/accounts
+- More robust testing on waste-water charges, I do not have this on my account so was unable to test it
 
 ## Acknowledgements
 
