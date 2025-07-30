@@ -233,9 +233,14 @@ class WatercareUsageSensor(SensorEntity):
             "billing_period_from": latest_period.get("billingPeriodFromDate"),
             "billing_period_to": latest_period.get("billingPeriodToDate"),
             "reading_type": latest_period.get("readingType"),
+            "account_balance": latest_period.get("accountBalance"),
+            "amount_due": latest_period.get("amountDue"),
             "household_efficiency_band": latest_period.get("statistics", {})
             .get("efficiency", {})
             .get("currentHouseholdBand"),
+            "usage_to_lower_band": latest_period.get("statistics", {})
+            .get("efficiency", {})
+            .get("usageToLowerBand"),
             "current_period_cost": round(cost_breakdown["total"], 2),
             "current_period_cost_consumption": round(cost_breakdown["consumption"], 2),
             "current_period_cost_wastewater": round(cost_breakdown["wastewater"], 2),
@@ -446,6 +451,9 @@ class WatercareUsageSensor(SensorEntity):
             "wastewater_rate_per_1000L": self._wastewater_rate,
             "endpoint": self._endpoint,
             "cost_currency": "NZD",
+            "account_balance": parsed_data.get("accountBalance"),
+            "amount_due": parsed_data.get("amountDue"),
+            "reading_type": parsed_data.get("readingType"),
             "currentPeriodAverage": statistic_data.get("currentPeriodAverage"),
             "differenceToPreviousPeriod": statistic_data.get(
                 "differenceToPreviousPeriod"
