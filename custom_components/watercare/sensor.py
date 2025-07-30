@@ -331,7 +331,6 @@ class WatercareUsageSensor(SensorEntity):
                     _LOGGER.warning(f"Failed to parse date {end_date_str}: {e}")
                     continue
 
-        # Add consumption statistics to Home Assistant
         if period_statistics:
             metadata = StatisticMetaData(
                 has_mean=False,
@@ -349,12 +348,11 @@ class WatercareUsageSensor(SensorEntity):
         else:
             _LOGGER.warning("No valid consumption statistics generated")
 
-        # Add total cost statistics to Home Assistant
         if cost_statistics:
             cost_metadata = StatisticMetaData(
                 has_mean=False,
                 has_sum=True,
-                name="Watercare Water Cost",
+                name="Watercare Total Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:water_cost",
                 unit_of_measurement="NZD",
