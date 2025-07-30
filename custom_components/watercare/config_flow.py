@@ -10,9 +10,13 @@ from .const import (
     DOMAIN,
     CONF_CONSUMPTION_RATE,
     CONF_WASTEWATER_RATE,
+    CONF_WASTEWATER_RATIO,
+    CONF_ANNUAL_LINE_CHARGE,
     CONF_ENDPOINT,
     DEFAULT_CONSUMPTION_RATE,
     DEFAULT_WASTEWATER_RATE,
+    DEFAULT_WASTEWATER_RATIO,
+    DEFAULT_ANNUAL_LINE_CHARGE,
     DEFAULT_ENDPOINT,
     ENDPOINT_OPTIONS,
 )
@@ -30,6 +34,12 @@ DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_WASTEWATER_RATE, default=DEFAULT_WASTEWATER_RATE): vol.Coerce(
             float
         ),
+        vol.Optional(
+            CONF_WASTEWATER_RATIO, default=DEFAULT_WASTEWATER_RATIO
+        ): vol.Coerce(float),
+        vol.Optional(
+            CONF_ANNUAL_LINE_CHARGE, default=DEFAULT_ANNUAL_LINE_CHARGE
+        ): vol.Coerce(float),
     }
 )
 
@@ -58,6 +68,12 @@ class WatercareConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ),
                 CONF_WASTEWATER_RATE: user_input.get(
                     CONF_WASTEWATER_RATE, DEFAULT_WASTEWATER_RATE
+                ),
+                CONF_WASTEWATER_RATIO: user_input.get(
+                    CONF_WASTEWATER_RATIO, DEFAULT_WASTEWATER_RATIO
+                ),
+                CONF_ANNUAL_LINE_CHARGE: user_input.get(
+                    CONF_ANNUAL_LINE_CHARGE, DEFAULT_ANNUAL_LINE_CHARGE
                 ),
             },
         )
@@ -99,6 +115,18 @@ class WatercareOptionsFlowHandler(config_entries.OptionsFlowWithConfigEntry):
                         CONF_WASTEWATER_RATE,
                         default=self.config_entry.data.get(
                             CONF_WASTEWATER_RATE, DEFAULT_WASTEWATER_RATE
+                        ),
+                    ): vol.Coerce(float),
+                    vol.Optional(
+                        CONF_WASTEWATER_RATIO,
+                        default=self.config_entry.data.get(
+                            CONF_WASTEWATER_RATIO, DEFAULT_WASTEWATER_RATIO
+                        ),
+                    ): vol.Coerce(float),
+                    vol.Optional(
+                        CONF_ANNUAL_LINE_CHARGE,
+                        default=self.config_entry.data.get(
+                            CONF_ANNUAL_LINE_CHARGE, DEFAULT_ANNUAL_LINE_CHARGE
                         ),
                     ): vol.Coerce(float),
                 }

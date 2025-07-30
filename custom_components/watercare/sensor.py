@@ -18,9 +18,13 @@ from .const import (
     SENSOR_NAME,
     CONF_CONSUMPTION_RATE,
     CONF_WASTEWATER_RATE,
+    CONF_WASTEWATER_RATIO,
+    CONF_ANNUAL_LINE_CHARGE,
     CONF_ENDPOINT,
     DEFAULT_CONSUMPTION_RATE,
     DEFAULT_WASTEWATER_RATE,
+    DEFAULT_WASTEWATER_RATIO,
+    DEFAULT_ANNUAL_LINE_CHARGE,
     DEFAULT_ENDPOINT,
     ENDPOINT_DISPLAY_NAMES,
     STATISTIC_TYPES,
@@ -48,18 +52,32 @@ async def async_setup_entry(
     # Get rates and endpoint from config entry data
     consumption_rate = entry.data.get(CONF_CONSUMPTION_RATE, DEFAULT_CONSUMPTION_RATE)
     wastewater_rate = entry.data.get(CONF_WASTEWATER_RATE, DEFAULT_WASTEWATER_RATE)
+    wastewater_ratio = entry.data.get(CONF_WASTEWATER_RATIO, DEFAULT_WASTEWATER_RATIO)
+    annual_line_charge = entry.data.get(
+        CONF_ANNUAL_LINE_CHARGE, DEFAULT_ANNUAL_LINE_CHARGE
+    )
     endpoint = entry.data.get(CONF_ENDPOINT, DEFAULT_ENDPOINT)
 
     # Check for updated values in options
     if entry.options:
         consumption_rate = entry.options.get(CONF_CONSUMPTION_RATE, consumption_rate)
         wastewater_rate = entry.options.get(CONF_WASTEWATER_RATE, wastewater_rate)
+        wastewater_ratio = entry.options.get(CONF_WASTEWATER_RATIO, wastewater_ratio)
+        annual_line_charge = entry.options.get(
+            CONF_ANNUAL_LINE_CHARGE, annual_line_charge
+        )
         endpoint = entry.options.get(CONF_ENDPOINT, endpoint)
 
     async_add_entities(
         [
             WatercareUsageSensor(
-                SENSOR_NAME, api, consumption_rate, wastewater_rate, endpoint
+                SENSOR_NAME,
+                api,
+                consumption_rate,
+                wastewater_rate,
+                wastewater_ratio,
+                annual_line_charge,
+                endpoint,
             )
         ],
         True,
@@ -69,7 +87,16 @@ async def async_setup_entry(
 class WatercareUsageSensor(SensorEntity):
     """Define Watercare Usage sensor."""
 
-    def __init__(self, name, api, consumption_rate, wastewater_rate, endpoint):
+    def __init__(
+        self,
+        name,
+        api,
+        consumption_rate,
+        wastewater_rate,
+        wastewater_ratio,
+        annual_line_charge,
+        endpoint,
+    ):
         """Initialize Watercare Usage sensor."""
         self._name = name
         self._icon = "mdi:water"
@@ -82,6 +109,8 @@ class WatercareUsageSensor(SensorEntity):
         self._api = api
         self._consumption_rate = consumption_rate
         self._wastewater_rate = wastewater_rate
+        self._wastewater_ratio = wastewater_ratio
+        self._annual_line_charge = annual_line_charge
         self._endpoint = endpoint
 
     @property
@@ -124,19 +153,23 @@ class WatercareUsageSensor(SensorEntity):
         """Return the unique id."""
         return self._unique_id
 
-    def _calculate_cost(self, usage_litres):
+    def _calculate_cost(self, usage_litres, numberOfDays):
         """Calculate the total cost based on usage and configured rates."""
         usage_thousands = usage_litres / 1000.0
 
         # Calculate cost components
         consumption_cost = usage_thousands * self._consumption_rate
-        wastewater_cost = usage_thousands * self._wastewater_rate
-        total_cost = consumption_cost + wastewater_cost
+        wastewater_cost = (
+            usage_thousands * self._wastewater_rate * self._wastewater_ratio
+        )
+        line_charge = (self._annual_line_charge / 365) * numberOfDays
+        total_cost = consumption_cost + wastewater_cost + line_charge
 
         return {
             "total": total_cost,
             "consumption": consumption_cost,
             "wastewater": wastewater_cost,
+            "line_charge": DEFAULT_ANNUAL_LINE_CHARGE / 365,
         }
 
     def _get_statistic_name(self, statistic_type: str) -> str:
@@ -183,8 +216,16 @@ class WatercareUsageSensor(SensorEntity):
         billing_period_usage = latest_period.get("waterUsage", 0)
         self._state = billing_period_usage
 
-        # Calculate current period cost breakdown
-        cost_breakdown = self._calculate_cost(billing_period_usage)
+        numberOfDays = (
+            datetime.strptime(
+                latest_period.get("billingPeriodToDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            - datetime.strptime(
+                latest_period.get("billingPeriodFromDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+        ).days + 1
+
+        cost_breakdown = self._calculate_cost(billing_period_usage, numberOfDays)
 
         self._state_attributes = {
             "billing_period_usage": billing_period_usage,
@@ -243,12 +284,19 @@ class WatercareUsageSensor(SensorEntity):
                     end_date = datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
                     end_date = pytz.utc.localize(end_date).astimezone(NZ_TIMEZONE)
 
-                    # Add this period's usage to running total (like meridian_energy does)
                     period_usage = period.get("waterUsage", 0)
                     running_sum += period_usage
 
-                    # Calculate cost breakdown for this period
-                    cost_breakdown = self._calculate_cost(period_usage)
+                    numberOfDays = (
+                        datetime.strptime(
+                            period.get("billingPeriodToDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
+                        )
+                        - datetime.strptime(
+                            period.get("billingPeriodFromDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
+                        )
+                    ).days + 1
+
+                    cost_breakdown = self._calculate_cost(period_usage, numberOfDays)
                     cost_running_sum += cost_breakdown["total"]
                     consumption_cost_running_sum += cost_breakdown["consumption"]
                     wastewater_cost_running_sum += cost_breakdown["wastewater"]
@@ -388,7 +436,7 @@ class WatercareUsageSensor(SensorEntity):
         _LOGGER.debug(f"yesterday_consumption: {yesterday_consumption}")
 
         # Calculate cost for yesterday's consumption
-        cost_breakdown = self._calculate_cost(yesterday_consumption)
+        cost_breakdown = self._calculate_cost(yesterday_consumption, 1)
 
         efficiency_data = statistic_data.get("efficiency", {})
         self._state_attributes = {
@@ -425,7 +473,7 @@ class WatercareUsageSensor(SensorEntity):
             litresRunningSum += litres
 
             # Calculate cost for this day
-            daily_cost_breakdown = self._calculate_cost(litres)
+            daily_cost_breakdown = self._calculate_cost(litres, 1)
             running_cost_sum += daily_cost_breakdown["total"]
             consumption_cost_running_sum += daily_cost_breakdown["consumption"]
             wastewater_cost_running_sum += daily_cost_breakdown["wastewater"]
