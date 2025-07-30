@@ -1,6 +1,9 @@
 """Constants for Watercare integration."""
 
 from homeassistant.const import Platform
+import pytz
+
+NZ_TIMEZONE = pytz.timezone("Pacific/Auckland")
 
 DOMAIN = "watercare"
 SENSOR_NAME = "Watercare"

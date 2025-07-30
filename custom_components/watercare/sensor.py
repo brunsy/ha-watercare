@@ -14,6 +14,7 @@ from homeassistant.components.recorder.statistics import async_add_external_stat
 
 from .const import (
     DOMAIN,
+    NZ_TIMEZONE,
     SENSOR_NAME,
     CONF_CONSUMPTION_RATE,
     CONF_WASTEWATER_RATE,
@@ -220,7 +221,6 @@ class WatercareUsageSensor(SensorEntity):
         )
         import pytz
 
-        nz_timezone = pytz.timezone("Pacific/Auckland")
         period_statistics = []
         cost_statistics = []
         consumption_cost_statistics = []
@@ -241,7 +241,7 @@ class WatercareUsageSensor(SensorEntity):
                 try:
                     # Parse and convert to NZ timezone
                     end_date = datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-                    end_date = pytz.utc.localize(end_date).astimezone(nz_timezone)
+                    end_date = pytz.utc.localize(end_date).astimezone(NZ_TIMEZONE)
 
                     # Add this period's usage to running total (like meridian_energy does)
                     period_usage = period.get("waterUsage", 0)
@@ -367,13 +367,12 @@ class WatercareUsageSensor(SensorEntity):
 
         litresRunningSum = 0
         daily_consumption = {}
-        nz_timezone = pytz.timezone("Pacific/Auckland")
 
         for entry in usage_data:
             timestamp_str = entry.get("timestamp")
             litres = entry.get("litres", 0)
             timestamp = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-            timestamp = pytz.utc.localize(timestamp).astimezone(nz_timezone)
+            timestamp = pytz.utc.localize(timestamp).astimezone(NZ_TIMEZONE)
             date_str = timestamp.strftime("%Y-%m-%d")
 
             daily_consumption[date_str] = daily_consumption.get(date_str, 0) + litres
@@ -381,7 +380,7 @@ class WatercareUsageSensor(SensorEntity):
         _LOGGER.debug(f"Daily consumption: {daily_consumption}")
 
         # Assign yesterday's consumption to state
-        yesterday_date = (datetime.now(nz_timezone) - timedelta(days=1)).strftime(
+        yesterday_date = (datetime.now(NZ_TIMEZONE) - timedelta(days=1)).strftime(
             "%Y-%m-%d"
         )
         yesterday_consumption = daily_consumption.get(yesterday_date, 0)
@@ -420,7 +419,7 @@ class WatercareUsageSensor(SensorEntity):
         first = True
 
         for date, litres in daily_consumption.items():
-            start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=nz_timezone)
+            start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=NZ_TIMEZONE)
 
             # HASSIO statistics requires us to add values as a sum of all previous values.
             litresRunningSum += litres
