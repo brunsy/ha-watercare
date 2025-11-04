@@ -212,7 +212,7 @@ class WatercareApi:
 
         url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
         if start_date and end_date:
-            url += f"?startDate={start_date}&endDate={end_date}"
+            url += f"?from={start_date}&to={end_date}"
 
         _LOGGER.debug(f"Calling API URL: {url}")
 
