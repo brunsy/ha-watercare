@@ -193,13 +193,15 @@ class WatercareUsageSensor(SensorEntity):
             await self.process_data(response)
 
     async def process_data(self, response):
-        """Process the billing period data (mechanicalmonthly, monthly, halfhourly)."""
+        """Process the API response."""
+        if response is None:
+            _LOGGER.error("No response received from Watercare API; skipping processing")
+            return
+
         try:
             billing_periods = json.loads(response)
-        except json.JSONDecodeError:
-            _LOGGER.error(
-                f"Failed to parse JSON response for endpoint {self._endpoint}"
-            )
+        except (TypeError, json.JSONDecodeError) as err:
+            _LOGGER.error("Failed to parse Watercare API response: %s", err)
             return
 
         _LOGGER.debug(f"Processing data: {billing_periods}")
