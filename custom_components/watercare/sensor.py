@@ -8,6 +8,7 @@ import pytz
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.const import UnitOfVolume
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -15,6 +16,8 @@ from homeassistant.components.recorder.models import (
     StatisticMeanType,
 )
 from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.util.unit_conversion import VolumeConverter
+import homeassistant.util.dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -284,11 +287,18 @@ class WatercareUsageSensor(SensorEntity):
             end_date_str = period.get("billingPeriodToDate")
             if end_date_str:
                 try:
-                    # Parse and convert to NZ timezone
+                    # Parse and convert to local day boundary for proper statistics alignment
                     end_date = datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
                     end_date = pytz.utc.localize(end_date).astimezone(NZ_TIMEZONE)
+                    # Align to start of day for proper Energy Dashboard statistics
+                    stat_date = dt_util.start_of_local_day(end_date)
 
                     period_usage = period.get("waterUsage", 0)
+                    # Skip negative values (meter corrections)
+                    if period_usage < 0:
+                        _LOGGER.debug(f"Skipping negative usage value: {period_usage}")
+                        continue
+
                     running_sum += period_usage
 
                     numberOfDays = (
@@ -305,21 +315,32 @@ class WatercareUsageSensor(SensorEntity):
                     consumption_cost_running_sum += cost_breakdown["consumption"]
                     wastewater_cost_running_sum += cost_breakdown["wastewater"]
 
-                    # Create StatisticData with running sum (critical for Energy Dashboard)
+                    # Create StatisticData with both state (period value) and sum (running total)
+                    # Both are required for Energy Dashboard to work correctly
                     period_statistics.append(
-                        StatisticData(start=end_date, sum=running_sum)
+                        StatisticData(
+                            start=stat_date,
+                            state=period_usage,
+                            sum=running_sum,
+                        )
                     )
 
                     # Create cost statistics
                     cost_statistics.append(
-                        StatisticData(start=end_date, sum=cost_running_sum)
+                        StatisticData(
+                            start=stat_date,
+                            state=cost_breakdown["total"],
+                            sum=cost_running_sum,
+                        )
                     )
 
                     # Create consumption cost statistics if rate is configured
                     if self._consumption_rate > 0:
                         consumption_cost_statistics.append(
                             StatisticData(
-                                start=end_date, sum=consumption_cost_running_sum
+                                start=stat_date,
+                                state=cost_breakdown["consumption"],
+                                sum=consumption_cost_running_sum,
                             )
                         )
 
@@ -327,7 +348,9 @@ class WatercareUsageSensor(SensorEntity):
                     if self._wastewater_rate > 0:
                         wastewater_cost_statistics.append(
                             StatisticData(
-                                start=end_date, sum=wastewater_cost_running_sum
+                                start=stat_date,
+                                state=cost_breakdown["wastewater"],
+                                sum=wastewater_cost_running_sum,
                             )
                         )
 
@@ -341,9 +364,9 @@ class WatercareUsageSensor(SensorEntity):
                 name="Watercare Water Consumption",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:water_consumption",
-                unit_of_measurement=self._unit_of_measurement,
+                unit_of_measurement=UnitOfVolume.LITERS,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class=VolumeConverter.UNIT_CLASS,
             )
 
             _LOGGER.debug(
@@ -476,7 +499,11 @@ class WatercareUsageSensor(SensorEntity):
         first = True
 
         for date, litres in daily_consumption.items():
-            start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=NZ_TIMEZONE)
+            parsed_date = datetime.strptime(date, "%Y-%m-%d").replace(
+                tzinfo=NZ_TIMEZONE
+            )
+            # Align to start of local day for proper Energy Dashboard statistics
+            start = dt_util.start_of_local_day(parsed_date)
 
             # HASSIO statistics requires us to add values as a sum of all previous values.
             litresRunningSum += litres
@@ -491,24 +518,38 @@ class WatercareUsageSensor(SensorEntity):
                 reset = start
                 first = False
 
-            # Add consumption statistics
+            # Add consumption statistics with both state (period value) and sum (running total)
             day_statistics.append(
-                StatisticData(start=start, sum=litresRunningSum, last_reset=reset)
+                StatisticData(start=start, state=litres, sum=litresRunningSum)
             )
 
-            # Add cost statistics
-            cost_statistics.append(StatisticData(start=start, sum=running_cost_sum))
+            # Add cost statistics with both state and sum
+            cost_statistics.append(
+                StatisticData(
+                    start=start,
+                    state=daily_cost_breakdown["total"],
+                    sum=running_cost_sum,
+                )
+            )
 
             # Add consumption cost statistics if rate is configured
             if self._consumption_rate > 0:
                 consumption_cost_statistics.append(
-                    StatisticData(start=start, sum=consumption_cost_running_sum)
+                    StatisticData(
+                        start=start,
+                        state=daily_cost_breakdown["consumption"],
+                        sum=consumption_cost_running_sum,
+                    )
                 )
 
             # Add wastewater cost statistics if rate is configured
             if self._wastewater_rate > 0:
                 wastewater_cost_statistics.append(
-                    StatisticData(start=start, sum=wastewater_cost_running_sum)
+                    StatisticData(
+                        start=start,
+                        state=daily_cost_breakdown["wastewater"],
+                        sum=wastewater_cost_running_sum,
+                    )
                 )
 
         # Add daily consumption statistics
@@ -518,9 +559,9 @@ class WatercareUsageSensor(SensorEntity):
                 name=self._get_statistic_name("consumption"),
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:daily_consumption",
-                unit_of_measurement=self._unit_of_measurement,
+                unit_of_measurement=UnitOfVolume.LITERS,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class=VolumeConverter.UNIT_CLASS,
             )
 
             _LOGGER.debug(f"Adding {len(day_statistics)} daily consumption statistics")
