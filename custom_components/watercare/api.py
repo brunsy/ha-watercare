@@ -1,5 +1,6 @@
 """Watercare API."""
 
+from datetime import datetime, timedelta
 import aiohttp
 import logging
 from typing import Any
@@ -216,6 +217,20 @@ class WatercareApi:
             "mechanicalmonthly",
         ]:
             raise ValueError("Invalid endpoint specified")
+
+        if endpoint == "halfhourly":
+            # default to last 7 days if not specified
+            if start_date is None:
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=7)
+            elif end_date is None:
+                end_date = datetime.now()
+
+        if isinstance(start_date, datetime):
+            start_date = start_date.isoformat()
+
+        if isinstance(end_date, datetime):
+            end_date = end_date.isoformat()
 
         # If no account number, need to authenticate first
         if not self._accountNumber:
