@@ -1,25 +1,31 @@
 """Config flow for Watercare integration."""
 
-import logging
-import voluptuous as vol
+from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING, Any
+
+import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
 from .const import (
-    DOMAIN,
+    CONF_ANNUAL_LINE_CHARGE,
     CONF_CONSUMPTION_RATE,
+    CONF_ENDPOINT,
     CONF_WASTEWATER_RATE,
     CONF_WASTEWATER_RATIO,
-    CONF_ANNUAL_LINE_CHARGE,
-    CONF_ENDPOINT,
+    DEFAULT_ANNUAL_LINE_CHARGE,
     DEFAULT_CONSUMPTION_RATE,
+    DEFAULT_ENDPOINT,
     DEFAULT_WASTEWATER_RATE,
     DEFAULT_WASTEWATER_RATIO,
-    DEFAULT_ANNUAL_LINE_CHARGE,
-    DEFAULT_ENDPOINT,
+    DOMAIN,
     ENDPOINT_OPTIONS,
 )
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,7 +55,9 @@ class WatercareConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         if user_input is None:
             return self.async_show_form(
@@ -79,7 +87,9 @@ class WatercareConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     @staticmethod
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> WatercareOptionsFlowHandler:
         """Get the options flow for this handler."""
         return WatercareOptionsFlowHandler(config_entry)
 
@@ -87,10 +97,9 @@ class WatercareConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class WatercareOptionsFlowHandler(config_entries.OptionsFlowWithConfigEntry):
     """Handle options."""
 
-    def __init__(self, config_entry):
-        """Initialize options flow."""
-
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)

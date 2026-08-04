@@ -1,38 +1,44 @@
 """Watercare sensors."""
 
-from datetime import datetime, timedelta
-import logging
-import json
-import pytz
+from __future__ import annotations
 
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.sensor import SensorEntity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+import json
+import logging
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
 from homeassistant.components.recorder.models import (
     StatisticData,
-    StatisticMetaData,
     StatisticMeanType,
+    StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.sensor import SensorEntity
 
 from .const import (
-    DOMAIN,
-    NZ_TIMEZONE,
-    SENSOR_NAME,
+    CONF_ANNUAL_LINE_CHARGE,
     CONF_CONSUMPTION_RATE,
+    CONF_ENDPOINT,
     CONF_WASTEWATER_RATE,
     CONF_WASTEWATER_RATIO,
-    CONF_ANNUAL_LINE_CHARGE,
-    CONF_ENDPOINT,
+    DEFAULT_ANNUAL_LINE_CHARGE,
     DEFAULT_CONSUMPTION_RATE,
+    DEFAULT_ENDPOINT,
     DEFAULT_WASTEWATER_RATE,
     DEFAULT_WASTEWATER_RATIO,
-    DEFAULT_ANNUAL_LINE_CHARGE,
-    DEFAULT_ENDPOINT,
+    DOMAIN,
     ENDPOINT_DISPLAY_NAMES,
+    NZ_TIMEZONE,
+    SENSOR_NAME,
     STATISTIC_TYPES,
 )
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
+    from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+    from .api import WatercareApi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,10 +49,8 @@ async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
-    discovery_info=None,
-):
+) -> bool:
     """Set up the Watercare sensor platform."""
-
     if "api" not in hass.data[DOMAIN]:
         _LOGGER.error("API instance not found in config entry data.")
         return False
@@ -84,23 +88,25 @@ async def async_setup_entry(
                 endpoint,
             )
         ],
-        True,
+        update_before_add=True,
     )
+
+    return True
 
 
 class WatercareUsageSensor(SensorEntity):
     """Define Watercare Usage sensor."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- mirrors the integration's config options; grouping into a dataclass would ripple through call sites for no behavior change
         self,
-        name,
-        api,
-        consumption_rate,
-        wastewater_rate,
-        wastewater_ratio,
-        annual_line_charge,
-        endpoint,
-    ):
+        name: str,
+        api: WatercareApi,
+        consumption_rate: float,
+        wastewater_rate: float,
+        wastewater_ratio: float,
+        annual_line_charge: float,
+        endpoint: str,
+    ) -> None:
         """Initialize Watercare Usage sensor."""
         self._name = name
         self._icon = "mdi:water"
@@ -118,46 +124,48 @@ class WatercareUsageSensor(SensorEntity):
         self._endpoint = endpoint
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def icon(self):
+    def icon(self) -> str:
         """Icon to use in the frontend, if any."""
         return self._icon
 
     @property
-    def state(self):
+    def state(self) -> float | None:
         """Return the state of the device."""
         return self._state
 
     @property
-    def extra_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the sensor."""
         return self._state_attributes
 
     @property
-    def unit_of_measurement(self):
+    def unit_of_measurement(self) -> str:
         """Return the unit of measurement."""
         return self._unit_of_measurement
 
     @property
-    def state_class(self):
+    def state_class(self) -> str:
         """Return the state class."""
         return self._state_class
 
     @property
-    def device_class(self):
+    def device_class(self) -> str:
         """Return the device class."""
         return self._device_class
 
     @property
-    def unique_id(self):
+    def unique_id(self) -> str:
         """Return the unique id."""
         return self._unique_id
 
-    def _calculate_cost(self, usage_litres, numberOfDays):
+    def _calculate_cost(
+        self, usage_litres: float, number_of_days: int
+    ) -> dict[str, float]:
         """Calculate the total cost based on usage and configured rates."""
         usage_thousands = usage_litres / 1000.0
 
@@ -166,7 +174,7 @@ class WatercareUsageSensor(SensorEntity):
         wastewater_cost = (
             usage_thousands * self._wastewater_rate * self._wastewater_ratio
         )
-        line_charge = (self._annual_line_charge / 365) * numberOfDays
+        line_charge = (self._annual_line_charge / 365) * number_of_days
         total_cost = consumption_cost + wastewater_cost + line_charge
 
         return {
@@ -184,19 +192,20 @@ class WatercareUsageSensor(SensorEntity):
         type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
         return f"Watercare {endpoint_name} {type_name}"
 
-    async def async_update(self):
+    async def async_update(self) -> None:
         """Update the sensor data."""
-        _LOGGER.debug(f"Beginning sensor update using endpoint: {self._endpoint}")
+        _LOGGER.debug("Beginning sensor update using endpoint: %s", self._endpoint)
         response = await self._api.get_data(endpoint=self._endpoint)
 
         # Route to appropriate processing method based on endpoint
         if self._endpoint == "dailywithstats":
             await self.process_daily_data(response)
         else:
-            # For mechanicalmonthly, monthly, halfhourly - use the billing period processing
+            # For mechanicalmonthly, monthly, and halfhourly, use the
+            # billing period processing.
             await self.process_data(response)
 
-    async def process_data(self, response):
+    async def process_data(self, response: str | None) -> None:
         """Process the API response."""
         if response is None:
             _LOGGER.error(
@@ -206,11 +215,11 @@ class WatercareUsageSensor(SensorEntity):
 
         try:
             billing_periods = json.loads(response)
-        except (TypeError, json.JSONDecodeError) as err:
-            _LOGGER.error("Failed to parse Watercare API response: %s", err)
+        except json.JSONDecodeError:
+            _LOGGER.exception("Failed to parse Watercare API response")
             return
 
-        _LOGGER.debug(f"Processing data: {billing_periods}")
+        _LOGGER.debug("Processing data: %s", billing_periods)
 
         if not billing_periods:
             _LOGGER.warning("No billing periods found")
@@ -224,16 +233,16 @@ class WatercareUsageSensor(SensorEntity):
         billing_period_usage = latest_period.get("waterUsage", 0)
         self._state = billing_period_usage
 
-        numberOfDays = (
+        number_of_days = (
             datetime.strptime(
                 latest_period.get("billingPeriodToDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-            )
+            ).replace(tzinfo=UTC)
             - datetime.strptime(
                 latest_period.get("billingPeriodFromDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-            )
+            ).replace(tzinfo=UTC)
         ).days + 1
 
-        cost_breakdown = self._calculate_cost(billing_period_usage, numberOfDays)
+        cost_breakdown = self._calculate_cost(billing_period_usage, number_of_days)
 
         self._state_attributes = {
             "billing_period_usage": billing_period_usage,
@@ -261,8 +270,14 @@ class WatercareUsageSensor(SensorEntity):
         # Generate external statistics for Energy Dashboard
         await self.generate_statistics(billing_periods)
 
-    async def generate_statistics(self, billing_periods):
-        """Generate external statistics from billing period data following Energy Dashboard pattern."""
+    async def generate_statistics(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
+        self, billing_periods: list[dict[str, Any]]
+    ) -> None:
+        """
+        Generate external statistics from billing period data.
+
+        Follows the Energy Dashboard pattern.
+        """
         if not billing_periods:
             return
 
@@ -285,27 +300,30 @@ class WatercareUsageSensor(SensorEntity):
             if end_date_str:
                 try:
                     # Parse and convert to NZ timezone
-                    end_date = datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-                    end_date = pytz.utc.localize(end_date).astimezone(NZ_TIMEZONE)
+                    end_date = datetime.strptime(
+                        end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+                    ).replace(tzinfo=UTC)
+                    end_date = end_date.astimezone(NZ_TIMEZONE)
 
                     period_usage = period.get("waterUsage", 0)
                     running_sum += period_usage
 
-                    numberOfDays = (
+                    number_of_days = (
                         datetime.strptime(
                             period.get("billingPeriodToDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-                        )
+                        ).replace(tzinfo=UTC)
                         - datetime.strptime(
-                            period.get("billingPeriodFromDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-                        )
+                            period.get("billingPeriodFromDate"),
+                            "%Y-%m-%dT%H:%M:%S.%fZ",
+                        ).replace(tzinfo=UTC)
                     ).days + 1
 
-                    cost_breakdown = self._calculate_cost(period_usage, numberOfDays)
+                    cost_breakdown = self._calculate_cost(period_usage, number_of_days)
                     cost_running_sum += cost_breakdown["total"]
                     consumption_cost_running_sum += cost_breakdown["consumption"]
                     wastewater_cost_running_sum += cost_breakdown["wastewater"]
 
-                    # Create StatisticData with running sum (critical for Energy Dashboard)
+                    # Running sum is required by the Energy Dashboard
                     period_statistics.append(
                         StatisticData(start=end_date, sum=running_sum)
                     )
@@ -332,7 +350,7 @@ class WatercareUsageSensor(SensorEntity):
                         )
 
                 except (ValueError, TypeError) as e:
-                    _LOGGER.warning(f"Failed to parse date {end_date_str}: {e}")
+                    _LOGGER.warning("Failed to parse date %s: %s", end_date_str, e)
                     continue
 
         if period_statistics:
@@ -347,7 +365,7 @@ class WatercareUsageSensor(SensorEntity):
             )
 
             _LOGGER.debug(
-                f"Adding {len(period_statistics)} water consumption statistics"
+                "Adding %s water consumption statistics", len(period_statistics)
             )
             async_add_external_statistics(self.hass, metadata, period_statistics)
         else:
@@ -364,7 +382,7 @@ class WatercareUsageSensor(SensorEntity):
                 unit_class=None,
             )
 
-            _LOGGER.debug(f"Adding {len(cost_statistics)} water cost statistics")
+            _LOGGER.debug("Adding %s water cost statistics", len(cost_statistics))
             async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
         else:
             _LOGGER.warning("No valid cost statistics generated")
@@ -382,7 +400,8 @@ class WatercareUsageSensor(SensorEntity):
             )
 
             _LOGGER.debug(
-                f"Adding {len(consumption_cost_statistics)} consumption cost statistics"
+                "Adding %s consumption cost statistics",
+                len(consumption_cost_statistics),
             )
             async_add_external_statistics(
                 self.hass, consumption_cost_metadata, consumption_cost_statistics
@@ -401,37 +420,50 @@ class WatercareUsageSensor(SensorEntity):
             )
 
             _LOGGER.debug(
-                f"Adding {len(wastewater_cost_statistics)} wastewater cost statistics"
+                "Adding %s wastewater cost statistics",
+                len(wastewater_cost_statistics),
             )
             async_add_external_statistics(
                 self.hass, wastewater_cost_metadata, wastewater_cost_statistics
             )
 
-    async def process_daily_data(self, response):
+    async def process_daily_data(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
+        self, response: str | None
+    ) -> None:
         """Process the daily data."""
+        if response is None:
+            _LOGGER.error(
+                "No response received from Watercare API; skipping processing"
+            )
+            return
+
         try:
             parsed_data = json.loads(response)
         except json.JSONDecodeError:
-            _LOGGER.error("Failed to parse JSON response for dailywithstats endpoint")
+            _LOGGER.exception(
+                "Failed to parse JSON response for dailywithstats endpoint"
+            )
             return
 
-        _LOGGER.debug(f"Parsed data: {parsed_data}")
+        _LOGGER.debug("Parsed data: %s", parsed_data)
         usage_data = parsed_data.get("usage", [])
         statistic_data = parsed_data.get("statistics", {})
 
-        litresRunningSum = 0
+        litres_running_sum = 0
         daily_consumption = {}
 
         for entry in usage_data:
             timestamp_str = entry.get("timestamp")
             litres = entry.get("litres", 0)
-            timestamp = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-            timestamp = pytz.utc.localize(timestamp).astimezone(NZ_TIMEZONE)
+            timestamp = datetime.strptime(
+                timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=UTC)
+            timestamp = timestamp.astimezone(NZ_TIMEZONE)
             date_str = timestamp.strftime("%Y-%m-%d")
 
             daily_consumption[date_str] = daily_consumption.get(date_str, 0) + litres
 
-        _LOGGER.debug(f"Daily consumption: {daily_consumption}")
+        _LOGGER.debug("Daily consumption: %s", daily_consumption)
 
         # Assign yesterday's consumption to state
         yesterday_date = (datetime.now(NZ_TIMEZONE) - timedelta(days=1)).strftime(
@@ -439,7 +471,7 @@ class WatercareUsageSensor(SensorEntity):
         )
         yesterday_consumption = daily_consumption.get(yesterday_date, 0)
         self._state = yesterday_consumption
-        _LOGGER.debug(f"yesterday_consumption: {yesterday_consumption}")
+        _LOGGER.debug("yesterday_consumption: %s", yesterday_consumption)
 
         # Calculate cost for yesterday's consumption
         cost_breakdown = self._calculate_cost(yesterday_consumption, 1)
@@ -478,8 +510,9 @@ class WatercareUsageSensor(SensorEntity):
         for date, litres in daily_consumption.items():
             start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=NZ_TIMEZONE)
 
-            # HASSIO statistics requires us to add values as a sum of all previous values.
-            litresRunningSum += litres
+            # HASSIO statistics require values to be a running sum of all
+            # previous values.
+            litres_running_sum += litres
 
             # Calculate cost for this day
             daily_cost_breakdown = self._calculate_cost(litres, 1)
@@ -493,7 +526,7 @@ class WatercareUsageSensor(SensorEntity):
 
             # Add consumption statistics
             day_statistics.append(
-                StatisticData(start=start, sum=litresRunningSum, last_reset=reset)
+                StatisticData(start=start, sum=litres_running_sum, last_reset=reset)
             )
 
             # Add cost statistics
@@ -523,7 +556,7 @@ class WatercareUsageSensor(SensorEntity):
                 unit_class=None,
             )
 
-            _LOGGER.debug(f"Adding {len(day_statistics)} daily consumption statistics")
+            _LOGGER.debug("Adding %s daily consumption statistics", len(day_statistics))
             async_add_external_statistics(self.hass, day_metadata, day_statistics)
         else:
             _LOGGER.warning("No daily statistics found, skipping update")
@@ -540,7 +573,7 @@ class WatercareUsageSensor(SensorEntity):
                 unit_class=None,
             )
 
-            _LOGGER.debug(f"Adding {len(cost_statistics)} daily cost statistics")
+            _LOGGER.debug("Adding %s daily cost statistics", len(cost_statistics))
             async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
 
         # Add daily consumption cost statistics if configured
@@ -556,7 +589,8 @@ class WatercareUsageSensor(SensorEntity):
             )
 
             _LOGGER.debug(
-                f"Adding {len(consumption_cost_statistics)} daily consumption cost statistics"
+                "Adding %s daily consumption cost statistics",
+                len(consumption_cost_statistics),
             )
             async_add_external_statistics(
                 self.hass, consumption_cost_metadata, consumption_cost_statistics
@@ -575,7 +609,8 @@ class WatercareUsageSensor(SensorEntity):
             )
 
             _LOGGER.debug(
-                f"Adding {len(wastewater_cost_statistics)} daily wastewater cost statistics"
+                "Adding %s daily wastewater cost statistics",
+                len(wastewater_cost_statistics),
             )
             async_add_external_statistics(
                 self.hass, wastewater_cost_metadata, wastewater_cost_statistics

@@ -1,7 +1,7 @@
 """Constants for Watercare integration."""
 
-from homeassistant.const import Platform
 import pytz
+from homeassistant.const import Platform
 
 NZ_TIMEZONE = pytz.timezone("Pacific/Auckland")
 

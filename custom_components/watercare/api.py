@@ -1,29 +1,36 @@
 """Watercare API."""
 
-import aiohttp
-import logging
-from typing import Any
-from collections.abc import Mapping
-import json
-import secrets
-import hashlib
+from __future__ import annotations
+
 import base64
+import hashlib
+import json
+import logging
+import secrets
 import uuid
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
+import aiohttp
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 _LOGGER = logging.getLogger(__name__)
+
+_HTTP_OK = 200
 
 
 class WatercareApi:
     """Define the Watercare API."""
 
-    def __init__(self, email, password):
+    def __init__(self, email: str, password: str) -> None:
         """Initialise the API."""
         self._client_id = "799c26af-c35b-4010-bd04-b6a7ebdba811"
         self._redirect_uri = "msauth://nz.co.watercare/yRDm0vmCd9zdnwt1eCLGp8KfdLY%3D"
         self._url_base = "https://customerapp.api.water.co.nz/"
         self._url_token_base = (
-            "https://wslpwb2cprd.b2clogin.com/tfp/wslpwb2cprd.onmicrosoft.com"
+            "https://wslpwb2cprd.b2clogin.com/tfp/wslpwb2cprd.onmicrosoft.com"  # noqa: S105 -- URL host, not a credential
         )
         self._p = "B2C_1_sign_up_or_sign_in_mobile"
 
@@ -44,17 +51,17 @@ class WatercareApi:
                 return json.loads(json_string)
         return None
 
-    def generate_code_verifier(self):
+    def generate_code_verifier(self) -> str:
         """Generate code verifier for OAuth steps."""
         code_verifier = secrets.token_urlsafe(100)
         return code_verifier[:128]
 
-    def generate_code_challenge(self, code_verifier):
+    def generate_code_challenge(self, code_verifier: str) -> str:
         """Generate code challenge for OAuth steps."""
         code_challenge = hashlib.sha256(code_verifier.encode()).digest()
         return base64.urlsafe_b64encode(code_challenge).rstrip(b"=").decode()
 
-    async def get_refresh_token(self):
+    async def get_refresh_token(self) -> None:  # noqa: PLR0915 -- linear OAuth flow, splitting would fragment the auth sequence
         """Get the refresh token."""
         _LOGGER.debug("API get_refresh_token")
         jar = aiohttp.CookieJar(quote_cookie=False)
@@ -81,12 +88,15 @@ class WatercareApi:
                 response_text = await response.text()
 
             settings_json = self.get_setting_json(response_text)
-            _LOGGER.debug(f"settings_json: {settings_json}")
+            _LOGGER.debug("settings_json: %s", settings_json)
 
             trans_id = settings_json.get("transId")
             csrf = settings_json.get("csrf")
 
-            url = f"{self._url_token_base}/{self._p}/SelfAsserted?tx={trans_id}&p={self._p}"
+            url = (
+                f"{self._url_token_base}/{self._p}/SelfAsserted"
+                f"?tx={trans_id}&p={self._p}"
+            )
             payload = {
                 "request_type": "RESPONSE",
                 "email": self._email,
@@ -97,7 +107,10 @@ class WatercareApi:
             async with session.post(url, headers=headers, data=payload) as response:
                 await response.text()
 
-            url = f"{self._url_token_base}/{self._p}/api/CombinedSigninAndSignup/confirmed"
+            url = (
+                f"{self._url_token_base}/{self._p}"
+                "/api/CombinedSigninAndSignup/confirmed"
+            )
             params = {
                 "rememberMe": "false",
                 "csrf_token": csrf,
@@ -116,14 +129,14 @@ class WatercareApi:
                         response.status,
                         response_text,
                     )
-                    raise ValueError(
-                        f"Sign-in confirmation failed with status {response.status}"
-                    )
+                    msg = f"Sign-in confirmation failed with status {response.status}"
+                    raise ValueError(msg)
 
                 location = response.headers.get("Location", "")
                 if not location:
                     _LOGGER.error("No Location header in response")
-                    raise ValueError("No redirect location in sign-in response")
+                    msg = "No redirect location in sign-in response"
+                    raise ValueError(msg)
 
                 query_params = parse_qs(location.split("?", 1)[1])
                 if "error" in query_params:
@@ -131,9 +144,10 @@ class WatercareApi:
                     _LOGGER.error(
                         "Error description: %s", query_params["error_description"][0]
                     )
-                    raise ValueError(
+                    msg = (
                         f"Authentication error: {query_params['error_description'][0]}"
                     )
+                    raise ValueError(msg)
 
             code = query_params["code"][0]
 
@@ -161,7 +175,7 @@ class WatercareApi:
             _LOGGER.debug("Refresh token retrieved successfully.")
             await self.get_accounts()
 
-    async def get_api_token(self):
+    async def get_api_token(self) -> None:
         """Get token from the Watercare API."""
         token_data = {
             "grant_type": "refresh_token",
@@ -173,15 +187,15 @@ class WatercareApi:
         async with aiohttp.ClientSession(cookie_jar=jar) as session:
             url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
             async with session.post(url, data=token_data) as response:
-                if response.status == 200:
-                    jsonResult = await response.json()
-                    self._token = jsonResult["access_token"]
-                    _LOGGER.debug(f"Authenticity Token: {self._token}")
+                if response.status == _HTTP_OK:
+                    json_result = await response.json()
+                    self._token = json_result["access_token"]
+                    _LOGGER.debug("Access token retrieved successfully.")
                     await self.get_accounts()
                 else:
                     _LOGGER.error("Failed to retrieve the token page.")
 
-    async def get_accounts(self):
+    async def get_accounts(self) -> None:
         """Get the first account that we see."""
         headers = {"authorization": "Bearer " + (self._token or "")}
         jar = aiohttp.CookieJar(quote_cookie=False)
@@ -189,13 +203,13 @@ class WatercareApi:
             aiohttp.ClientSession(cookie_jar=jar) as session,
             session.get(self._url_base + "v1/account", headers=headers) as result,
         ):
-            if result.status == 200:
+            if result.status == _HTTP_OK:
                 data = await result.json()
-                _LOGGER.debug(f"Accounts: {data}")
+                _LOGGER.debug("Accounts: %s", data)
                 if data and isinstance(data, list) and len(data) > 0:
                     self._accountNumber = data[0].get("accountNumber")
                     if self._accountNumber:
-                        _LOGGER.debug(f"AccountNumber: {self._accountNumber}")
+                        _LOGGER.debug("AccountNumber: %s", self._accountNumber)
                     else:
                         _LOGGER.error("Account number not found in the response")
                 else:
@@ -206,8 +220,8 @@ class WatercareApi:
                 )
 
     async def get_data(
-        self, endpoint: str, start_date: str = None, end_date: str = None
-    ):
+        self, endpoint: str, start_date: str | None = None, end_date: str | None = None
+    ) -> str | None:
         """Get data from the API."""
         if endpoint not in [
             "halfhourly",
@@ -215,7 +229,8 @@ class WatercareApi:
             "monthly",
             "mechanicalmonthly",
         ]:
-            raise ValueError("Invalid endpoint specified")
+            msg = "Invalid endpoint specified"
+            raise ValueError(msg)
 
         # If no account number, need to authenticate first
         if not self._accountNumber:
@@ -231,18 +246,17 @@ class WatercareApi:
         if start_date and end_date:
             url += f"?from={start_date}&to={end_date}"
 
-        _LOGGER.debug(f"Calling API URL: {url}")
+        _LOGGER.debug("Calling API URL: %s", url)
 
         jar = aiohttp.CookieJar(quote_cookie=False)
         async with (
             aiohttp.ClientSession(cookie_jar=jar) as session,
             session.get(url, headers=headers) as response,
         ):
-            if response.status == 200:
+            if response.status == _HTTP_OK:
                 data = await response.text()
-                _LOGGER.debug(f"API Response status: {response.status}")
-                _LOGGER.debug(f"API Response data length: {len(data) if data else 0}")
+                _LOGGER.debug("API Response status: %s", response.status)
+                _LOGGER.debug("API Response data length: %s", len(data) if data else 0)
                 return data
-            else:
-                _LOGGER.error(f"Could not fetch consumption: {response.status}")
-                return None
+            _LOGGER.error("Could not fetch consumption: %s", response.status)
+            return None

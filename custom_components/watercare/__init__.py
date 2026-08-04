@@ -1,13 +1,18 @@
 """Watercare custom integration."""
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
 from .api import WatercareApi
+from .const import DOMAIN
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
+    from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -16,7 +21,6 @@ PLATFORMS = [Platform.SENSOR]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Watercare from a config entry."""
-
     # Handle both old (email) and new (username) config formats
     email = entry.data.get("username") or entry.data.get("email")
     password = entry.data.get("password")

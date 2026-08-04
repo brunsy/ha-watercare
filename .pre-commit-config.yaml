@@ -1,0 +1,28 @@
+# Mirrors the CI "Lint" workflow (.github/workflows/lint.yml) exactly:
+# `ruff check .` and `ruff format . --check`, using whatever `ruff` is on
+# PATH (pinned via requirements_lint.txt) rather than a separately-managed
+# pre-commit venv, so there's no risk of drifting from the version CI uses.
+#
+# Both hooks are intentionally non-mutating (--check, no --fix) instead of
+# auto-fixing: ruff==0.15.21's formatter has a known bug that mangles
+# single-line `except (A, B):` tuples (no `as` binding) into invalid syntax
+# by stripping the required parentheses (see commit 1133810). Auto-fixing
+# would silently write that broken syntax into the file instead of failing
+# loudly, so these hooks just block the commit and show the diff -- fix the
+# same way the codebase already does elsewhere: spread the tuple across
+# multiple lines with a trailing comma, which ruff's formatter leaves alone.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: python3 -m ruff check .
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: ruff-format
+        name: ruff format --check
+        entry: python3 -m ruff format . --check
+        language: system
+        pass_filenames: false
+        types: [python]
