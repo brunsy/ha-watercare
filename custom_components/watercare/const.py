@@ -14,6 +14,7 @@ CONF_WASTEWATER_RATE = "wastewater_rate"
 CONF_WASTEWATER_RATIO = "wastewater_ratio"
 CONF_ANNUAL_LINE_CHARGE = "annual_line_charge"
 CONF_ENDPOINT = "endpoint"
+CONF_HISTORY_BACKFILLED = "history_backfilled"
 
 # Default cost rate per 1000L (NZD) - typical NZ Watercare rates
 DEFAULT_CONSUMPTION_RATE = 2.296  # $2.296 per 1000L

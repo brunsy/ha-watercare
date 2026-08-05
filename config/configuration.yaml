@@ -1,4 +1,3 @@
-
 # Minimal set of integrations for developing/testing the watercare
 # custom component. default_config: was replaced because it also
 # loads usb/bluetooth/go2rtc, which fail to set up in this devcontainer.
@@ -8,6 +7,11 @@ logbook:
 recorder:
 system_health:
 
+# Not part of any default/always-on integration set (unlike frontend/cloud) --
+# needed explicitly for the Energy dashboard nav item + the watercare
+# integration's external statistics to be viewable.
+energy:
+
 # Load frontend themes from the themes folder
 frontend:
   themes: !include_dir_merge_named themes
@@ -15,3 +19,8 @@ frontend:
 automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
+
+logger:
+  default: info
+  logs:
+    custom_components.watercare: debug

@@ -1,3 +1,24 @@
 -r requirements_lint.txt
 colorlog==6.10.1
 homeassistant==2026.6.4
+
+# homeassistant's own package metadata doesn't declare these, but the
+# frontend/cloud integrations are always loaded (see bootstrap.py
+# DEFAULT_INTEGRATIONS) and HA does not auto-install requirements for
+# "system" type integrations at runtime -- so a plain `pip install
+# homeassistant` leaves them missing. Versions pinned to what this
+# homeassistant release's own manifests require.
+home-assistant-frontend==20260527.7
+numpy==2.3.2
+av==16.0.1
+PyTurboJPEG==1.8.3
+rf-protocols==4.0.1
+ha-ffmpeg==3.2.2
+infrared-protocols==5.6.1
+aiohasupervisor==0.4.3
+hassil==3.7.0
+home-assistant-intents==2026.6.1
+mutagen==1.47.0
+pymicro-vad==1.0.1
+pyspeex-noise==1.0.2
+openai==2.21.0
