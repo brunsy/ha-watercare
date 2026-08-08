@@ -1,0 +1,28 @@
+[
+  {
+    "timestamp": "2026-05-31T12:00:00.000Z",
+    "litres": 17500,
+    "numberOfMissingDays": 0,
+    "statistics": {
+      "currentPeriodAverage": 110,
+      "differenceToPreviousPeriod": -3,
+      "efficiency": {
+        "currentHouseholdBand": 1,
+        "usageToLowerBand": 0
+      }
+    }
+  },
+  {
+    "timestamp": "2026-07-31T12:00:00.000Z",
+    "litres": 661,
+    "numberOfMissingDays": 24,
+    "statistics": {
+      "currentPeriodAverage": 94,
+      "differenceToPreviousPeriod": 5,
+      "efficiency": {
+        "currentHouseholdBand": 1,
+        "usageToLowerBand": 0
+      }
+    }
+  }
+]

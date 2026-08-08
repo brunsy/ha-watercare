@@ -9,15 +9,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import (
-    StatisticData,
-    StatisticMeanType,
-    StatisticMetaData,
-)
-from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    get_last_statistics,
-)
+from homeassistant.components.recorder.models import StatisticData
+from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.util.unit_conversion import VolumeConverter
 
@@ -39,6 +32,7 @@ from .const import (
     SENSOR_NAME,
     STATISTIC_TYPES,
 )
+from .statistics_helpers import accumulate_cost_series, push_statistic_series
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -241,6 +235,25 @@ class WatercareUsageSensor(SensorEntity):
             "line_charge": line_charge,
         }
 
+    def _parse_json_response(
+        self,
+        response: str | None,
+        *,
+        exceptions: tuple[type[Exception], ...] = (TypeError, json.JSONDecodeError),
+        error_message: str = "Failed to parse Watercare API response",
+    ) -> Any | None:
+        """Parse a JSON API response, logging and returning None on failure."""
+        if response is None:
+            _LOGGER.error(
+                "No response received from Watercare API; skipping processing"
+            )
+            return None
+        try:
+            return json.loads(response)
+        except exceptions:
+            _LOGGER.exception(error_message)
+            return None
+
     def _get_statistic_name(self, statistic_type: str) -> str:
         """Generate consistent statistic names based on endpoint and type."""
         endpoint_name = ENDPOINT_DISPLAY_NAMES.get(
@@ -295,19 +308,8 @@ class WatercareUsageSensor(SensorEntity):
 
     async def process_data(self, response: str | None) -> None:
         """Process the API response."""
-        if response is None:
-            _LOGGER.error(
-                "No response received from Watercare API; skipping processing"
-            )
-            return
-
-        try:
-            billing_periods = json.loads(response)
-        except (
-            TypeError,
-            json.JSONDecodeError,
-        ):
-            _LOGGER.exception("Failed to parse Watercare API response")
+        billing_periods = self._parse_json_response(response)
+        if billing_periods is None:
             return
 
         _LOGGER.debug("Processing data: %s", billing_periods)
@@ -361,9 +363,7 @@ class WatercareUsageSensor(SensorEntity):
         # Generate external statistics for Energy Dashboard
         await self.generate_statistics(billing_periods)
 
-    async def generate_statistics(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
-        self, billing_periods: list[dict[str, Any]]
-    ) -> None:
+    async def generate_statistics(self, billing_periods: list[dict[str, Any]]) -> None:
         """
         Generate external statistics from billing period data.
 
@@ -372,151 +372,86 @@ class WatercareUsageSensor(SensorEntity):
         if not billing_periods:
             return
 
-        period_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        running_sum = 0
-        cost_running_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-
         # Sort periods by date (oldest first) for cumulative calculation
         sorted_periods = sorted(
             billing_periods, key=lambda x: x.get("billingPeriodToDate", "")
         )
 
+        entries = []
         for period in sorted_periods:
             end_date_str = period.get("billingPeriodToDate")
-            if end_date_str:
-                try:
-                    # Parse and convert to NZ timezone
-                    end_date = datetime.strptime(
-                        end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+            if not end_date_str:
+                continue
+            try:
+                # Parse and convert to NZ timezone
+                end_date = datetime.strptime(
+                    end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+                ).replace(tzinfo=UTC)
+                end_date = end_date.astimezone(NZ_TIMEZONE)
+
+                number_of_days = (
+                    datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                        tzinfo=UTC
+                    )
+                    - datetime.strptime(
+                        period.get("billingPeriodFromDate"),
+                        "%Y-%m-%dT%H:%M:%S.%fZ",
                     ).replace(tzinfo=UTC)
-                    end_date = end_date.astimezone(NZ_TIMEZONE)
+                ).days + 1
+            except (ValueError, TypeError) as e:
+                _LOGGER.warning("Failed to parse date %s: %s", end_date_str, e)
+                continue
 
-                    period_usage = period.get("waterUsage", 0)
-                    running_sum += period_usage
+            entries.append((end_date, period.get("waterUsage", 0), number_of_days))
 
-                    number_of_days = (
-                        datetime.strptime(
-                            period.get("billingPeriodToDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-                        ).replace(tzinfo=UTC)
-                        - datetime.strptime(
-                            period.get("billingPeriodFromDate"),
-                            "%Y-%m-%dT%H:%M:%S.%fZ",
-                        ).replace(tzinfo=UTC)
-                    ).days + 1
+        (
+            consumption_points,
+            cost_points,
+            consumption_cost_points,
+            wastewater_cost_points,
+        ) = accumulate_cost_series(
+            entries,
+            calculate_cost=self._calculate_cost,
+            consumption_rate=self._consumption_rate,
+            wastewater_rate=self._wastewater_rate,
+        )
 
-                    cost_breakdown = self._calculate_cost(period_usage, number_of_days)
-                    cost_running_sum += cost_breakdown["total"]
-                    consumption_cost_running_sum += cost_breakdown["consumption"]
-                    wastewater_cost_running_sum += cost_breakdown["wastewater"]
-
-                    # Running sum is required by the Energy Dashboard
-                    period_statistics.append(
-                        StatisticData(start=end_date, sum=running_sum)
-                    )
-
-                    # Create cost statistics
-                    cost_statistics.append(
-                        StatisticData(start=end_date, sum=cost_running_sum)
-                    )
-
-                    # Create consumption cost statistics if rate is configured
-                    if self._consumption_rate > 0:
-                        consumption_cost_statistics.append(
-                            StatisticData(
-                                start=end_date, sum=consumption_cost_running_sum
-                            )
-                        )
-
-                    # Create wastewater cost statistics if rate is configured
-                    if self._wastewater_rate > 0:
-                        wastewater_cost_statistics.append(
-                            StatisticData(
-                                start=end_date, sum=wastewater_cost_running_sum
-                            )
-                        )
-
-                except (ValueError, TypeError) as e:
-                    _LOGGER.warning("Failed to parse date %s: %s", end_date_str, e)
-                    continue
-
-        if period_statistics:
-            metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Water Consumption",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:water_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=VolumeConverter.UNIT_CLASS,
-            )
-
-            _LOGGER.debug(
-                "Adding %s water consumption statistics", len(period_statistics)
-            )
-            async_add_external_statistics(self.hass, metadata, period_statistics)
-        else:
-            _LOGGER.warning("No valid consumption statistics generated")
-
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Total Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:water_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug("Adding %s water cost statistics", len(cost_statistics))
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-        else:
-            _LOGGER.warning("No valid cost statistics generated")
-
-        # Add consumption cost statistics if configured
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                "Adding %s consumption cost statistics",
-                len(consumption_cost_statistics),
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        # Add wastewater cost statistics if configured
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                "Adding %s wastewater cost statistics",
-                len(wastewater_cost_statistics),
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        push_statistic_series(
+            self.hass,
+            consumption_points,
+            statistic_id=f"{DOMAIN}:water_consumption",
+            name="Watercare Water Consumption",
+            unit=self._unit_of_measurement,
+            unit_class=VolumeConverter.UNIT_CLASS,
+            empty_warning="No valid consumption statistics generated",
+        )
+        push_statistic_series(
+            self.hass,
+            cost_points,
+            statistic_id=f"{DOMAIN}:water_cost",
+            name="Watercare Total Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning="No valid cost statistics generated",
+        )
+        push_statistic_series(
+            self.hass,
+            consumption_cost_points,
+            statistic_id=f"{DOMAIN}:consumption_cost",
+            name="Watercare Consumption Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
+        push_statistic_series(
+            self.hass,
+            wastewater_cost_points,
+            statistic_id=f"{DOMAIN}:wastewater_cost",
+            name="Watercare Wastewater Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
 
     def _days_in_monthly_reading(self, reading: dict[str, Any]) -> int:
         """Estimate the number of days a monthly reading's litres figure covers."""
@@ -542,19 +477,8 @@ class WatercareUsageSensor(SensorEntity):
         month -- {timestamp, litres, numberOfMissingDays, statistics} --
         not billing periods, so it needs its own running-sum handling.
         """
-        if response is None:
-            _LOGGER.error(
-                "No response received from Watercare API; skipping processing"
-            )
-            return
-
-        try:
-            monthly_readings = json.loads(response)
-        except (
-            TypeError,
-            json.JSONDecodeError,
-        ):
-            _LOGGER.exception("Failed to parse Watercare API response")
+        monthly_readings = self._parse_json_response(response)
+        if monthly_readings is None:
             return
 
         _LOGGER.debug(
@@ -597,7 +521,7 @@ class WatercareUsageSensor(SensorEntity):
 
         await self.generate_monthly_statistics(sorted_readings)
 
-    async def generate_monthly_statistics(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
+    async def generate_monthly_statistics(
         self, monthly_readings: list[dict[str, Any]]
     ) -> None:
         """
@@ -609,15 +533,7 @@ class WatercareUsageSensor(SensorEntity):
         if not monthly_readings:
             return
 
-        period_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        running_sum = 0
-        cost_running_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-
+        entries = []
         for reading in monthly_readings:
             timestamp_str = reading.get("timestamp")
             if not timestamp_str:
@@ -631,100 +547,62 @@ class WatercareUsageSensor(SensorEntity):
                 continue
             end_date = end_date.astimezone(NZ_TIMEZONE)
 
-            litres = reading.get("litres", 0)
-            running_sum += litres
-
-            cost_breakdown = self._calculate_cost(
-                litres, self._days_in_monthly_reading(reading)
-            )
-            cost_running_sum += cost_breakdown["total"]
-            consumption_cost_running_sum += cost_breakdown["consumption"]
-            wastewater_cost_running_sum += cost_breakdown["wastewater"]
-
-            period_statistics.append(StatisticData(start=end_date, sum=running_sum))
-            cost_statistics.append(StatisticData(start=end_date, sum=cost_running_sum))
-
-            if self._consumption_rate > 0:
-                consumption_cost_statistics.append(
-                    StatisticData(start=end_date, sum=consumption_cost_running_sum)
+            entries.append(
+                (
+                    end_date,
+                    reading.get("litres", 0),
+                    self._days_in_monthly_reading(reading),
                 )
-
-            if self._wastewater_rate > 0:
-                wastewater_cost_statistics.append(
-                    StatisticData(start=end_date, sum=wastewater_cost_running_sum)
-                )
-
-        if period_statistics:
-            metadata = StatisticMetaData(
-                has_sum=True,
-                name=self._get_statistic_name("consumption"),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=VolumeConverter.UNIT_CLASS,
             )
 
-            _LOGGER.debug(
-                "Adding %s monthly consumption statistics", len(period_statistics)
-            )
-            async_add_external_statistics(self.hass, metadata, period_statistics)
-        else:
-            _LOGGER.warning("No valid monthly consumption statistics generated")
+        (
+            consumption_points,
+            cost_points,
+            consumption_cost_points,
+            wastewater_cost_points,
+        ) = accumulate_cost_series(
+            entries,
+            calculate_cost=self._calculate_cost,
+            consumption_rate=self._consumption_rate,
+            wastewater_rate=self._wastewater_rate,
+        )
 
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Monthly Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug("Adding %s monthly cost statistics", len(cost_statistics))
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-        else:
-            _LOGGER.warning("No valid monthly cost statistics generated")
-
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Monthly Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                "Adding %s monthly consumption cost statistics",
-                len(consumption_cost_statistics),
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Monthly Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                "Adding %s monthly wastewater cost statistics",
-                len(wastewater_cost_statistics),
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        push_statistic_series(
+            self.hass,
+            consumption_points,
+            statistic_id=f"{DOMAIN}:monthly_consumption",
+            name=self._get_statistic_name("consumption"),
+            unit=self._unit_of_measurement,
+            unit_class=VolumeConverter.UNIT_CLASS,
+            empty_warning="No valid monthly consumption statistics generated",
+        )
+        push_statistic_series(
+            self.hass,
+            cost_points,
+            statistic_id=f"{DOMAIN}:monthly_cost",
+            name="Watercare Monthly Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning="No valid monthly cost statistics generated",
+        )
+        push_statistic_series(
+            self.hass,
+            consumption_cost_points,
+            statistic_id=f"{DOMAIN}:monthly_consumption_cost",
+            name="Watercare Monthly Consumption Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
+        push_statistic_series(
+            self.hass,
+            wastewater_cost_points,
+            statistic_id=f"{DOMAIN}:monthly_wastewater_cost",
+            name="Watercare Monthly Wastewater Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
 
     def _bucket_hourly_readings(
         self, readings: list[dict[str, Any]]
@@ -812,20 +690,15 @@ class WatercareUsageSensor(SensorEntity):
                 running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
             new_points.append(StatisticData(start=hour_start, sum=running_sum))
 
-        if not new_points:
-            return 0
-
-        metadata = StatisticMetaData(
-            has_sum=True,
-            name=name,
-            source=DOMAIN,
+        push_statistic_series(
+            self.hass,
+            new_points,
             statistic_id=statistic_id,
-            unit_of_measurement=unit,
-            mean_type=StatisticMeanType.NONE,
+            name=name,
+            unit=unit,
             unit_class=unit_class,
+            empty_warning=None,
         )
-        _LOGGER.debug("Adding %s statistics for %s", len(new_points), statistic_id)
-        async_add_external_statistics(self.hass, metadata, new_points)
         return len(new_points)
 
     async def _async_push_halfhourly_statistics(
@@ -880,19 +753,8 @@ class WatercareUsageSensor(SensorEntity):
         Unlike the other endpoints, halfhourly returns a bare list of
         {timestamp, litres} readings with no billing/account metadata.
         """
-        if response is None:
-            _LOGGER.error(
-                "No response received from Watercare API; skipping processing"
-            )
-            return
-
-        try:
-            readings = json.loads(response)
-        except (
-            TypeError,
-            json.JSONDecodeError,
-        ):
-            _LOGGER.exception("Failed to parse Watercare API response")
+        readings = self._parse_json_response(response)
+        if readings is None:
             return
 
         _LOGGER.debug("Processing halfhourly data: %s readings", len(readings or []))
@@ -1032,29 +894,20 @@ class WatercareUsageSensor(SensorEntity):
                 len(hourly_consumption),
             )
 
-    async def process_daily_data(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
-        self, response: str | None
-    ) -> None:
+    async def process_daily_data(self, response: str | None) -> None:
         """Process the daily data."""
-        if response is None:
-            _LOGGER.error(
-                "No response received from Watercare API; skipping processing"
-            )
-            return
-
-        try:
-            parsed_data = json.loads(response)
-        except json.JSONDecodeError:
-            _LOGGER.exception(
-                "Failed to parse JSON response for dailywithstats endpoint"
-            )
+        parsed_data = self._parse_json_response(
+            response,
+            exceptions=(json.JSONDecodeError,),
+            error_message="Failed to parse JSON response for dailywithstats endpoint",
+        )
+        if parsed_data is None:
             return
 
         _LOGGER.debug("Parsed data: %s", parsed_data)
         usage_data = parsed_data.get("usage", [])
         statistic_data = parsed_data.get("statistics", {})
 
-        litres_running_sum = 0
         daily_consumption = {}
 
         for entry in usage_data:
@@ -1103,120 +956,60 @@ class WatercareUsageSensor(SensorEntity):
         }
 
         # Generate statistics for daily data
-        day_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        running_cost_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-        first = True
-
+        entries = []
+        reset = None
         for date, litres in daily_consumption.items():
             start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=NZ_TIMEZONE)
-
-            # HASSIO statistics require values to be a running sum of all
-            # previous values.
-            litres_running_sum += litres
-
-            # Calculate cost for this day
-            daily_cost_breakdown = self._calculate_cost(litres, 1)
-            running_cost_sum += daily_cost_breakdown["total"]
-            consumption_cost_running_sum += daily_cost_breakdown["consumption"]
-            wastewater_cost_running_sum += daily_cost_breakdown["wastewater"]
-
-            if first:
+            if reset is None:
                 reset = start
-                first = False
+            entries.append((start, litres, 1))
 
-            # Add consumption statistics
-            day_statistics.append(
-                StatisticData(start=start, sum=litres_running_sum, last_reset=reset)
-            )
+        (
+            consumption_points,
+            cost_points,
+            consumption_cost_points,
+            wastewater_cost_points,
+        ) = accumulate_cost_series(
+            entries,
+            calculate_cost=self._calculate_cost,
+            consumption_rate=self._consumption_rate,
+            wastewater_rate=self._wastewater_rate,
+            last_reset=reset,
+        )
 
-            # Add cost statistics
-            cost_statistics.append(StatisticData(start=start, sum=running_cost_sum))
-
-            # Add consumption cost statistics if rate is configured
-            if self._consumption_rate > 0:
-                consumption_cost_statistics.append(
-                    StatisticData(start=start, sum=consumption_cost_running_sum)
-                )
-
-            # Add wastewater cost statistics if rate is configured
-            if self._wastewater_rate > 0:
-                wastewater_cost_statistics.append(
-                    StatisticData(start=start, sum=wastewater_cost_running_sum)
-                )
-
-        # Add daily consumption statistics
-        if day_statistics:
-            day_metadata = StatisticMetaData(
-                has_sum=True,
-                name=self._get_statistic_name("consumption"),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=VolumeConverter.UNIT_CLASS,
-            )
-
-            _LOGGER.debug("Adding %s daily consumption statistics", len(day_statistics))
-            async_add_external_statistics(self.hass, day_metadata, day_statistics)
-        else:
-            _LOGGER.warning("No daily statistics found, skipping update")
-
-        # Add daily cost statistics
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug("Adding %s daily cost statistics", len(cost_statistics))
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-
-        # Add daily consumption cost statistics if configured
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                "Adding %s daily consumption cost statistics",
-                len(consumption_cost_statistics),
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        # Add daily wastewater cost statistics if configured
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                "Adding %s daily wastewater cost statistics",
-                len(wastewater_cost_statistics),
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        push_statistic_series(
+            self.hass,
+            consumption_points,
+            statistic_id=f"{DOMAIN}:daily_consumption",
+            name=self._get_statistic_name("consumption"),
+            unit=self._unit_of_measurement,
+            unit_class=VolumeConverter.UNIT_CLASS,
+            empty_warning="No daily statistics found, skipping update",
+        )
+        push_statistic_series(
+            self.hass,
+            cost_points,
+            statistic_id=f"{DOMAIN}:daily_cost",
+            name="Watercare Daily Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
+        push_statistic_series(
+            self.hass,
+            consumption_cost_points,
+            statistic_id=f"{DOMAIN}:daily_consumption_cost",
+            name="Watercare Daily Consumption Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
+        push_statistic_series(
+            self.hass,
+            wastewater_cost_points,
+            statistic_id=f"{DOMAIN}:daily_wastewater_cost",
+            name="Watercare Daily Wastewater Cost",
+            unit="NZD",
+            unit_class=None,
+            empty_warning=None,
+        )
