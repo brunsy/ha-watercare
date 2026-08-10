@@ -95,6 +95,10 @@ async def async_setup_entry(
         )
         endpoint = entry.options.get(CONF_ENDPOINT, endpoint)
 
+    needs_backfill = endpoint == "halfhourly" and not entry.data.get(
+        CONF_HISTORY_BACKFILLED
+    )
+
     sensor = WatercareUsageSensor(
         SENSOR_NAME,
         api,
@@ -103,34 +107,21 @@ async def async_setup_entry(
         wastewater_ratio,
         annual_line_charge,
         endpoint,
+        entry,
+        needs_backfill=needs_backfill,
     )
     entry_data["sensor"] = sensor
 
-    needs_backfill = endpoint == "halfhourly" and not entry.data.get(
-        CONF_HISTORY_BACKFILLED
-    )
-
-    # When a backfill is pending, skip the immediate update-before-add: the
-    # backfill must run and land its (older) history first, since
-    # _async_push_hourly_statistic only appends points after the latest
-    # already-stored one -- doing the regular update first would set that
-    # watermark to "now" and cause the backfill's data to be silently
-    # discarded as already-superseded.
-    async_add_entities([sensor], update_before_add=not needs_backfill)
-
-    if needs_backfill:
-
-        async def _run_backfill() -> None:
-            await sensor.async_backfill_halfhourly_history()
-            hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_HISTORY_BACKFILLED: True}
-            )
-            await sensor.async_update()
-            sensor.async_write_ha_state()
-
-        entry.async_create_background_task(
-            hass, _run_backfill(), "watercare_history_backfill"
-        )
+    # Never block platform setup on update_before_add: the first update
+    # requires a full OAuth login (get_refresh_token() alone chains 4
+    # sequential HTTP round-trips to the Azure B2C login pages, plus
+    # get_accounts() and the usage request itself), which routinely takes
+    # long enough to trip HA's "setup is taking over 10 seconds" warning.
+    # Add the entity immediately -- it kicks off its own first update from
+    # async_added_to_hass() once hass/entity_id are actually set, rather
+    # than from a background task started here that could theoretically
+    # race the entity's own add-to-platform sequence.
+    async_add_entities([sensor], update_before_add=False)
 
     return True
 
@@ -147,6 +138,9 @@ class WatercareUsageSensor(SensorEntity):
         wastewater_ratio: float,
         annual_line_charge: float,
         endpoint: str,
+        entry: ConfigEntry,
+        *,
+        needs_backfill: bool,
     ) -> None:
         """Initialize Watercare Usage sensor."""
         self._name = name
@@ -173,6 +167,61 @@ class WatercareUsageSensor(SensorEntity):
         self._wastewater_ratio = wastewater_ratio
         self._annual_line_charge = annual_line_charge
         self._endpoint = endpoint
+        self._entry = entry
+        self._needs_backfill = needs_backfill
+
+    async def async_added_to_hass(self) -> None:
+        """
+        Kick off the sensor's first data fetch.
+
+        Runs from this lifecycle hook rather than from a task started
+        alongside async_add_entities() in async_setup_entry so it can't
+        possibly run before hass/entity_id are set on this entity -- HA
+        only calls async_added_to_hass() once the entity is fully added
+        to the platform.
+        """
+        await super().async_added_to_hass()
+        if self._needs_backfill:
+            self._entry.async_create_background_task(
+                self.hass, self._run_backfill(), "watercare_history_backfill"
+            )
+        else:
+            self._entry.async_create_background_task(
+                self.hass, self._run_initial_update(), "watercare_initial_update"
+            )
+
+    async def _run_backfill(self) -> None:
+        # Nothing awaits this background task, so an unhandled exception
+        # here would only surface as an asyncio "exception was never
+        # retrieved" warning with no entity state update at all -- catch,
+        # log, and still write whatever state was reached so the entity
+        # doesn't just sit unavailable with no explanation.
+        try:
+            # The backfill must land its (older) history before the regular
+            # update runs, since _async_push_hourly_statistic only appends
+            # points after the latest already-stored one -- doing the
+            # regular update first would set that watermark to "now" and
+            # cause the backfill's data to be silently discarded as
+            # already-superseded.
+            await self.async_backfill_halfhourly_history()
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, CONF_HISTORY_BACKFILLED: True}
+            )
+            await self.async_update()
+        except Exception:
+            _LOGGER.exception("Watercare history backfill failed")
+        finally:
+            self.async_write_ha_state()
+
+    async def _run_initial_update(self) -> None:
+        # See _run_backfill: nothing awaits this task, so failures need to
+        # be caught and logged here rather than left to escape silently.
+        try:
+            await self.async_update()
+        except Exception:
+            _LOGGER.exception("Watercare initial update failed")
+        finally:
+            self.async_write_ha_state()
 
     @property
     def name(self) -> str:

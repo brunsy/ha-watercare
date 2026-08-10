@@ -128,6 +128,8 @@ def make_sensor() -> Callable[..., watercare_sensor.WatercareUsageSensor]:
             wastewater_ratio,
             annual_line_charge,
             endpoint,
+            MagicMock(),
+            needs_backfill=False,
         )
         sensor.hass = MagicMock()
         return sensor
