@@ -13,20 +13,29 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
 import aiohttp
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from homeassistant.core import HomeAssistant
+
 _LOGGER = logging.getLogger(__name__)
 
 _HTTP_OK = 200
+_HTTP_UNAUTHORIZED = 401
+
+
+class WatercareAuthError(Exception):
+    """Raised when Watercare conclusively rejects the account credentials."""
 
 
 class WatercareApi:
     """Define the Watercare API."""
 
-    def __init__(self, email: str, password: str) -> None:
+    def __init__(self, hass: HomeAssistant, email: str, password: str) -> None:
         """Initialise the API."""
+        self._hass = hass
         self._client_id = "799c26af-c35b-4010-bd04-b6a7ebdba811"
         self._redirect_uri = "msauth://nz.co.watercare/yRDm0vmCd9zdnwt1eCLGp8KfdLY%3D"
         self._url_base = "https://customerapp.api.water.co.nz/"
@@ -147,14 +156,19 @@ class WatercareApi:
 
                 query_params = parse_qs(location.split("?", 1)[1])
                 if "error" in query_params:
-                    _LOGGER.error("Error in response: %s", query_params["error"][0])
-                    _LOGGER.error(
+                    # DEBUG, not ERROR: every poll re-runs this full login
+                    # while _accountNumber stays unset, so ERROR here would
+                    # repeat every retry -- the raised WatercareAuthError
+                    # (and the caller's single deduped warning) is the
+                    # user-facing signal.
+                    _LOGGER.debug("Error in response: %s", query_params["error"][0])
+                    _LOGGER.debug(
                         "Error description: %s", query_params["error_description"][0]
                     )
                     msg = (
                         f"Authentication error: {query_params['error_description'][0]}"
                     )
-                    raise ValueError(msg)
+                    raise WatercareAuthError(msg)
 
             code = query_params["code"][0]
 
@@ -182,34 +196,32 @@ class WatercareApi:
             _LOGGER.debug("Refresh token retrieved successfully.")
             await self.get_accounts()
 
-    async def get_api_token(self) -> None:
-        """Get token from the Watercare API."""
+    async def get_api_token(self) -> bool:
+        """Get token from the Watercare API. Returns whether it succeeded."""
         token_data = {
             "grant_type": "refresh_token",
             "client_id": self._client_id,
             "refresh_token": self._refresh_token,
         }
 
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with aiohttp.ClientSession(cookie_jar=jar) as session:
-            url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
-            async with session.post(url, data=token_data) as response:
-                if response.status == _HTTP_OK:
-                    json_result = await response.json()
-                    self._token = json_result["access_token"]
-                    _LOGGER.debug("Access token retrieved successfully.")
-                    await self.get_accounts()
-                else:
-                    _LOGGER.error("Failed to retrieve the token page.")
+        session = async_get_clientsession(self._hass)
+        url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
+        async with session.post(url, data=token_data) as response:
+            if response.status == _HTTP_OK:
+                json_result = await response.json()
+                self._token = json_result["access_token"]
+                _LOGGER.debug("Access token retrieved successfully.")
+                await self.get_accounts()
+                return True
+            _LOGGER.error("Failed to retrieve the token page.")
+            return False
 
     async def get_accounts(self) -> None:
         """Get the first account that we see."""
         headers = {"authorization": "Bearer " + (self._token or "")}
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with (
-            aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(self._url_base + "v1/account", headers=headers) as result,
-        ):
+        session = async_get_clientsession(self._hass)
+        url = self._url_base + "v1/account"
+        async with session.get(url, headers=headers) as result:
             if result.status == _HTTP_OK:
                 data = await result.json()
                 _LOGGER.debug("Accounts: %s", data)
@@ -239,14 +251,53 @@ class WatercareApi:
             msg = "Invalid endpoint specified"
             raise ValueError(msg)
 
-        # Serialize only the auth/token mutation: the regular poll and an
-        # on-demand backfill can both land here around the same time, and
-        # auth state is shared mutable instance state, not safe for
-        # concurrent access. The HTTP request itself is read-only against a
-        # snapshot of that state, so it runs outside the lock -- otherwise a
-        # long-running backfill request would stall regular polling.
+        if not await self._ensure_authenticated():
+            return None
+
+        status, data, error_text = await self._request_usage(
+            endpoint, start_date, end_date
+        )
+        if status == _HTTP_UNAUTHORIZED:
+            # Access token expired/rejected -- get_data() previously only
+            # re-authenticated when we had no account number at all, so once
+            # logged in once, a stale token would be reused forever and every
+            # later poll would 401. Re-authenticate once and retry.
+            _LOGGER.debug("Access token rejected (401); re-authenticating and retrying")
+            async with self._lock:
+                # The refresh-token grant can itself fail (e.g. the refresh
+                # token has expired) without raising -- it just leaves
+                # _token/_accountNumber as they were, which would otherwise
+                # look like a no-op success and retry with the same stale
+                # token. Fall back to a full login whenever it doesn't
+                # actually get us a fresh token.
+                refreshed = bool(self._refresh_token) and await self.get_api_token()
+                if not refreshed:
+                    await self.get_refresh_token()
+                if not self._accountNumber or not self._token:
+                    _LOGGER.error(
+                        "Re-authentication failed - no account number obtained"
+                    )
+                    return None
+
+            status, data, error_text = await self._request_usage(
+                endpoint, start_date, end_date
+            )
+
+        if status != _HTTP_OK:
+            _LOGGER.error("Could not fetch consumption: %s", status)
+            _LOGGER.debug("Error response body: %s", error_text)
+            return None
+        return data
+
+    async def _ensure_authenticated(self) -> bool:
+        """Authenticate if we don't yet have an account number."""
+        # Serialize the whole re-authentication flow, not just the state
+        # mutation: the regular poll and an on-demand backfill can both land
+        # here around the same time, and we don't want two concurrent OAuth
+        # logins racing over shared auth state. Only the single usage HTTP
+        # request in _request_usage() runs outside the lock, so a
+        # long-running backfill doesn't stall regular polling waiting on it.
         async with self._lock:
-            # If no account number, need to authenticate first
             if not self._accountNumber:
                 _LOGGER.debug(
                     "No account number found, starting authentication process"
@@ -254,8 +305,23 @@ class WatercareApi:
                 await self.get_refresh_token()
                 if not self._accountNumber:
                     _LOGGER.error("Authentication failed - no account number obtained")
-                    return None
+                    return False
+            return True
 
+    async def _request_usage(
+        self,
+        endpoint: str,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> tuple[int, str | None, str | None]:
+        """
+        Make a single usage request against a snapshot of the auth state.
+
+        Runs outside the lock -- it's read-only, and holding the lock here
+        would stall a concurrent regular poll behind a long-running backfill
+        request.
+        """
+        async with self._lock:
             account_number = self._accountNumber
             token = self._token
 
@@ -267,17 +333,12 @@ class WatercareApi:
 
         _LOGGER.debug("Calling API URL: %s", url)
 
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with (
-            aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(url, headers=headers) as response,
-        ):
+        session = async_get_clientsession(self._hass)
+        async with session.get(url, headers=headers) as response:
             if response.status == _HTTP_OK:
                 data = await response.text()
                 _LOGGER.debug("API Response status: %s", response.status)
                 _LOGGER.debug("API Response data length: %s", len(data) if data else 0)
-                return data
+                return response.status, data, None
             error_text = await response.text()
-            _LOGGER.error("Could not fetch consumption: %s", response.status)
-            _LOGGER.debug("Error response body: %s", error_text)
-            return None
+            return response.status, None, error_text

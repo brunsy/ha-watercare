@@ -20,6 +20,7 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.start import async_at_started
 from homeassistant.util.unit_conversion import VolumeConverter
 
+from .api import WatercareAuthError
 from .const import (
     CONF_ANNUAL_LINE_CHARGE,
     CONF_CONSUMPTION_RATE,
@@ -236,6 +237,11 @@ class WatercareUsageSensor(SensorEntity):
         self._entry = entry
         self._needs_backfill = needs_backfill
         self._unsub_scheduled_poll = None
+        # Guards _get_data(): the retry ladder can call it many times a day
+        # while credentials are actually broken, and async_start_reauth()
+        # itself dedupes concurrent flows but not the log spam -- only warn
+        # and start a flow once per outage, clearing on the next success.
+        self._reauth_started = False
         # Serializes regular updates and deep backfills: a scheduled poll
         # landing mid-backfill would otherwise advance the append-only
         # statistics watermark past the backfill's older history, silently
@@ -546,6 +552,43 @@ class WatercareUsageSensor(SensorEntity):
         type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
         return f"Watercare {endpoint_name} {type_name}"
 
+    async def _get_data(
+        self, endpoint: str, start_date: str | None, end_date: str | None
+    ) -> str | None:
+        """
+        Fetch data, starting HA's reauth flow if Watercare rejects the credentials.
+
+        A rejected password/refresh token isn't a transient failure the
+        normal retry ladder can recover from -- surface it the standard HA
+        way (a reauth prompt in Settings) instead of just logging forever.
+        Only the first rejection during an outage warns/starts a flow (see
+        _reauth_started); the retry ladder can otherwise call this many
+        times a day and spam the log for the entire outage.
+        """
+        try:
+            response = await self._api.get_data(
+                endpoint=endpoint, start_date=start_date, end_date=end_date
+            )
+        except WatercareAuthError as err:
+            # Rejected credentials aren't transient -- don't leave the
+            # hourly recovery-retry ladder (_should_poll_now) spinning on a
+            # login that can't succeed until the user completes reauth.
+            self._last_update_failed = False
+            if not self._reauth_started:
+                self._reauth_started = True
+                _LOGGER.warning(
+                    "Watercare credentials rejected; starting reauth flow: %s", err
+                )
+                self._entry.async_start_reauth(self.hass)
+            return None
+        if response is not None:
+            # Only an actual successful response re-arms the guard -- an
+            # unrelated transient failure (e.g. a non-200 from the usage
+            # endpoint) also returns None without raising, and must not be
+            # mistaken for recovery.
+            self._reauth_started = False
+        return response
+
     async def async_update(self) -> None:
         """Update the sensor data."""
         # The lock serializes this against a concurrently running deep
@@ -580,11 +623,18 @@ class WatercareUsageSensor(SensorEntity):
             # exception anywhere in the fetch also leaves the flag set and
             # _should_poll_now schedules hourly recovery retries.
             self._last_update_failed = True
-            response = await self._api.get_data(
+            response = await self._get_data(
                 endpoint=self._endpoint, start_date=start_date, end_date=end_date
             )
             if response is not None:
                 self._last_update_failed = False
+            elif self._reauth_started:
+                # Reauth already surfaces this to the user (one deduped
+                # warning + a Settings prompt) -- skip the generic "no
+                # response" error every poll while it's pending, so the
+                # hourly recovery ladder doesn't spam the log for the
+                # entire outage.
+                return
 
             # Route to appropriate processing method based on endpoint
             if self._endpoint == "dailywithstats":
@@ -1451,7 +1501,7 @@ class WatercareUsageSensor(SensorEntity):
 
         while (today - chunk_end).days < HALFHOURLY_BACKFILL_MAX_DAYS:
             chunk_start = chunk_end - timedelta(days=HALFHOURLY_BACKFILL_CHUNK_DAYS)
-            response = await self._api.get_data(
+            response = await self._get_data(
                 endpoint="halfhourly",
                 start_date=chunk_start.strftime("%Y-%m-%d"),
                 end_date=chunk_end.strftime("%Y-%m-%d"),

@@ -31,7 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("Missing username/email or password in config entry")
         return False
 
-    api = WatercareApi(email, password)
+    api = WatercareApi(hass, email, password)
 
     hass.data.setdefault(DOMAIN, {})
     # Keyed by entry_id: the config flow allows multiple Watercare accounts

@@ -4,20 +4,41 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
-from unittest.mock import AsyncMock
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
 from aioresponses import aioresponses
 
-from custom_components.watercare.api import WatercareApi
+import custom_components.watercare.api as api_module
+from custom_components.watercare.api import WatercareApi, WatercareAuthError
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 BASE_URL = "https://customerapp.api.water.co.nz/"
 
 
+@pytest.fixture(autouse=True)
+async def _clientsession(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[aiohttp.ClientSession]:
+    """
+    Stand in for HA's shared aiohttp session.
+
+    api.py fetches its session via async_get_clientsession(hass), which
+    needs a real HomeAssistant instance to cache against -- swap in a plain
+    aiohttp.ClientSession instead so tests don't need a full hass fixture.
+    """
+    session = aiohttp.ClientSession()
+    monkeypatch.setattr(api_module, "async_get_clientsession", lambda _hass: session)
+    yield session
+    await session.close()
+
+
 def _make_api() -> WatercareApi:
-    return WatercareApi("user@example.com", "hunter2")
+    return WatercareApi(MagicMock(), "user@example.com", "hunter2")
 
 
 async def test_get_data_invalid_endpoint_raises_before_any_network_call() -> None:
@@ -118,6 +139,76 @@ async def test_get_data_triggers_refresh_token_when_unauthenticated() -> None:
     assert result == "authed"
 
 
+async def test_get_data_reauthenticates_and_retries_on_401() -> None:
+    api = _make_api()
+    api._accountNumber = "123"
+    api._token = "stale-token"
+    api._refresh_token = "some-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        api._token = "fresh-token"
+        return True
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=401, body="")
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=200, body="retried-ok")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_api_token.assert_awaited_once()
+    assert result == "retried-ok"
+
+
+async def test_get_data_falls_back_to_full_login_when_refresh_grant_fails() -> None:
+    """Regression: a failed refresh-token grant isn't treated as re-auth success."""
+    api = _make_api()
+    api._accountNumber = "123"
+    api._token = "stale-token"
+    api._refresh_token = "expired-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        return False  # refresh token itself has expired; _token untouched
+
+    async def _fake_refresh_token(*_args: Any, **_kwargs: Any) -> None:
+        api._accountNumber = "123"
+        api._token = "fresh-token-from-full-login"
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+    api.get_refresh_token = AsyncMock(side_effect=_fake_refresh_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=401, body="")
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=200, body="retried-ok")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_api_token.assert_awaited_once()
+    api.get_refresh_token.assert_awaited_once()
+    assert result == "retried-ok"
+
+
+async def test_get_data_returns_none_when_reauth_after_401_fails() -> None:
+    api = _make_api()
+    api._accountNumber = "123"
+    api._token = "stale-token"
+    api._refresh_token = None
+
+    async def _fake_refresh_token(*_args: Any, **_kwargs: Any) -> None:
+        api._accountNumber = None  # re-authentication fails
+
+    api.get_refresh_token = AsyncMock(side_effect=_fake_refresh_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=401, body="")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_refresh_token.assert_awaited_once()
+    assert result is None
+
+
 async def test_get_data_returns_none_when_authentication_fails() -> None:
     api = _make_api()
 
@@ -125,9 +216,14 @@ async def test_get_data_returns_none_when_authentication_fails() -> None:
         side_effect=lambda: None
     )  # never sets _accountNumber
 
-    result = await api.get_data(endpoint="halfhourly")
+    # No routes registered: if get_data() proceeded to make a usage request
+    # despite failed auth, aioresponses would raise instead of letting a real
+    # network call slip through.
+    with aioresponses() as mocked:
+        result = await api.get_data(endpoint="halfhourly")
 
     assert result is None
+    mocked.assert_not_called()
 
 
 class _FakeResponse:
@@ -152,6 +248,35 @@ class _FakeGetContextManager:
 
     async def __aexit__(self, *_exc_info: object) -> bool:
         return False
+
+
+async def test_get_refresh_token_raises_on_confirmed_sign_in_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2C confirming a real credential rejection must surface as WatercareAuthError."""
+    api = _make_api()
+
+    settings_response = _FakeResponse(
+        200, 'var SETTINGS = {"transId": "tx123", "csrf": "csrf123"};'
+    )
+    confirmed_response = _FakeResponse(302, "")
+    confirmed_response.headers["Location"] = (
+        "msauth://nz.co.watercare/callback"
+        "?error=access_denied&error_description=Bad+password"
+    )
+    get_responses = iter([settings_response, confirmed_response])
+
+    def fake_get(_self: aiohttp.ClientSession, _url: str, **_kwargs: Any) -> Any:
+        return _FakeGetContextManager(next(get_responses))
+
+    def fake_post(_self: aiohttp.ClientSession, _url: str, **_kwargs: Any) -> Any:
+        return _FakeGetContextManager(_FakeResponse(200, ""))
+
+    monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get)
+    monkeypatch.setattr(aiohttp.ClientSession, "post", fake_post)
+
+    with pytest.raises(WatercareAuthError, match="Bad password"):
+        await api.get_refresh_token()
 
 
 async def test_get_data_http_request_runs_with_lock_released(

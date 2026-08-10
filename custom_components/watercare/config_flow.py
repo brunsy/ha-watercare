@@ -25,6 +25,8 @@ from .const import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 
 _LOGGER = logging.getLogger(__name__)
@@ -92,6 +94,41 @@ class WatercareConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> WatercareOptionsFlowHandler:
         """Get the options flow for this handler."""
         return WatercareOptionsFlowHandler(config_entry)
+
+    async def async_step_reauth(
+        self,
+        entry_data: Mapping[str, Any],  # noqa: ARG002 -- data lives on the reauth entry itself
+    ) -> ConfigFlowResult:
+        """Handle reauth, triggered when Watercare rejects stored credentials."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for a new username/password and save them on the existing entry."""
+        reauth_entry = self._get_reauth_entry()
+        if user_input is not None:
+            return self.async_update_reload_and_abort(
+                reauth_entry,
+                data_updates={
+                    CONF_USERNAME: user_input[CONF_USERNAME],
+                    CONF_PASSWORD: user_input[CONF_PASSWORD],
+                },
+            )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_USERNAME,
+                        default=reauth_entry.data.get(CONF_USERNAME)
+                        or reauth_entry.data.get("email", ""),
+                    ): str,
+                    vol.Required(CONF_PASSWORD): str,
+                }
+            ),
+        )
 
 
 class WatercareOptionsFlowHandler(config_entries.OptionsFlowWithConfigEntry):
