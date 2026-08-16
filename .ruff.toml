@@ -25,6 +25,10 @@ keep-runtime-typing = true
 max-complexity = 25
 
 [lint.per-file-ignores]
+"scripts/**" = [
+    "T201", # print -- these are CLI scripts, not library code
+    "D103", # docstrings on every function
+]
 "tests/**" = [
     "S101", # assert
     "S105", # hardcoded-password false positives on fake test tokens

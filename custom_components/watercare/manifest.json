@@ -8,6 +8,6 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/brunsy/ha-watercare/issues",
-  "requirements": ["aiohttp", "pytz", "voluptuous"],
+  "requirements": [],
   "version": "1.1.0"
 }

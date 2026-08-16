@@ -10,6 +10,11 @@ __pycache__
 .coverage
 .vscode
 coverage.xml
+.env
+.env.template
+
+# local-only debug scripts, not for publishing
+scripts/check_freshness
 
 
 # Home Assistant configuration

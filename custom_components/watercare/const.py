@@ -1,9 +1,15 @@
 """Constants for Watercare integration."""
 
-import pytz
+from zoneinfo import ZoneInfo
+
 from homeassistant.const import Platform
 
-NZ_TIMEZONE = pytz.timezone("Pacific/Auckland")
+# zoneinfo rather than pytz: pytz zones silently attach their historical
+# LMT offset (NZ: +11:39, not +12:00) when passed directly as tzinfo= to
+# the datetime constructor or replace(), a trap this codebase hit more
+# than once; zoneinfo zones work correctly as plain tzinfo objects, and
+# handle DST-gap/fold semantics without pytz's localize() machinery.
+NZ_TIMEZONE = ZoneInfo("Pacific/Auckland")
 
 DOMAIN = "watercare"
 SENSOR_NAME = "Watercare"

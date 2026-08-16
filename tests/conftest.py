@@ -11,7 +11,7 @@ those are monkeypatched directly with in-memory fakes instead.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -34,20 +34,32 @@ def load_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text()
 
 
-def nz_timestamp(days_ago: int, hour: int) -> str:
-    """Build a UTC API timestamp landing `days_ago` days back at `hour` in NZ time."""
-    nz_now = datetime.now(NZ_TIMEZONE)
-    target_date = (nz_now - timedelta(days=days_ago)).date()
+def nz_timestamp_on(target_date: date, hour: int, minute: int = 0) -> str:
+    """Build a UTC API timestamp landing at `hour`:`minute` NZ time on `target_date`."""
     nz_dt = datetime(
         target_date.year,
         target_date.month,
         target_date.day,
         hour,
-        0,
+        minute,
         0,
         tzinfo=NZ_TIMEZONE,
     )
     return nz_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def nz_timestamp(days_ago: int, hour: int, minute: int = 0) -> str:
+    """
+    Build a UTC API timestamp landing `days_ago` days back at `hour`:`minute` NZ time.
+
+    Callers that also need the target date for an assertion should prefer
+    computing `datetime.now(NZ_TIMEZONE)` once themselves and passing the
+    derived date to nz_timestamp_on() directly -- a second, separate
+    `now()` call here vs. in the assertion could diverge across an NZ
+    midnight boundary.
+    """
+    target_date = (datetime.now(NZ_TIMEZONE) - timedelta(days=days_ago)).date()
+    return nz_timestamp_on(target_date, hour, minute)
 
 
 class _FakeRecorderInstance:

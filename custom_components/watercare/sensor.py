@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from datetime import date as date_type
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.core import callback
+from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.start import async_at_started
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import (
@@ -35,6 +40,8 @@ from .const import (
 from .statistics_helpers import accumulate_cost_series, push_statistic_series
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -43,7 +50,44 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(hours=12)
+# Watercare publishes the previous day's final halfhourly readings around
+# 18:15-18:45 UTC, on a fixed UTC clock that ignores NZ daylight saving:
+# 06:15-06:45 NZST through 2026-09-26, then 07:15-07:45 NZDT once DST
+# started on 2026-09-27 (from the recorder's statistics write times, which
+# jumped from ~06:30 NZST to 08:00 NZDT -- the first retry slot after the
+# publish -- overnight). The same window was first measured against the
+# live API 2026-08-17 to 2026-08-20 (one run caught it mid-publish with an
+# incomplete last half-hour), but the exact time isn't fixed enough to just
+# pick a single margin. Rather than HA's default SCAN_INTERVAL, which polls
+# every 12h from whatever moment the entity happened to be added (so could
+# easily land both daily polls before Watercare has published), a standing
+# quarter-hour tick (see _schedule_polling) checks the UTC time against
+# these slots: while the previous NZ day is incomplete (see
+# _is_data_fresh), retry every 15 min through POLL_START_HOUR_UTC's own
+# hour (to catch the publish close to when it actually lands), then hourly
+# for POLL_RETRY_HOURS more hours -- self-correcting if the publish time
+# drifts, and no more API calls than needed once the data's in. If a
+# complete day still hasn't shown up by then, give up until the next day's
+# start hour rather than retrying indefinitely. The whole window
+# (18:00-00:00 UTC) falls within a single NZ calendar day in both NZST and
+# NZDT, so "the previous NZ day" means the same day throughout it.
+POLL_START_HOUR_UTC = 18
+QUARTER_HOUR_MINUTES = (0, 15, 30, 45)
+POLL_RETRY_HOURS = 6
+# (hour, minute) UTC retry slots: quarter-hourly during POLL_START_HOUR_UTC's
+# own hour, then hourly on the hour for POLL_RETRY_HOURS more hours
+# (wrapping past midnight UTC), the last one included.
+POLL_RETRY_SLOTS_UTC = tuple(
+    (POLL_START_HOUR_UTC, minute) for minute in QUARTER_HOUR_MINUTES
+) + tuple(
+    ((POLL_START_HOUR_UTC + offset) % 24, 0)
+    for offset in range(1, POLL_RETRY_HOURS + 1)
+)
+# Endpoints other than halfhourly have no characterized publish time to
+# retry against, so they poll on a fixed twice-daily schedule instead --
+# preserving the ~12h cadence of the SCAN_INTERVAL polling that this
+# fixed-time scheduling replaced.
+SECONDARY_POLL_HOUR_UTC = (POLL_START_HOUR_UTC + 12) % 24
 
 # The halfhourly endpoint silently caps each request at ~161 days regardless
 # of the requested range (it always starts exactly at the requested `from`
@@ -169,6 +213,33 @@ class WatercareUsageSensor(SensorEntity):
         self._endpoint = endpoint
         self._entry = entry
         self._needs_backfill = needs_backfill
+        self._unsub_scheduled_poll = None
+        # Serializes regular updates and deep backfills: a scheduled poll
+        # landing mid-backfill would otherwise advance the append-only
+        # statistics watermark past the backfill's older history, silently
+        # discarding it (see async_backfill_halfhourly_history).
+        self._update_lock = asyncio.Lock()
+        # Whether the most recent update got no response at all -- drives
+        # _should_poll_now's hourly recovery retries.
+        self._last_update_failed = False
+        # halfhourly polls once at the start hour (plus the stale-retry
+        # ladder, see POLL_RETRY_SLOTS_UTC); other endpoints poll twice
+        # daily (see SECONDARY_POLL_HOUR_UTC). (hour, minute) in UTC.
+        self._daily_poll_slots = (
+            ((POLL_START_HOUR_UTC, 0),)
+            if endpoint == "halfhourly"
+            else ((POLL_START_HOUR_UTC, 0), (SECONDARY_POLL_HOUR_UTC, 0))
+        )
+        # Latest complete NZ day confirmed in halfhourly readings -- drives
+        # _is_data_fresh's retry decision. Left unset by endpoints other
+        # than halfhourly, which don't publish on a characterized schedule
+        # (see POLL_START_HOUR_UTC).
+        self._latest_reading_date: date_type | None = None
+
+    @property
+    def should_poll(self) -> bool:
+        """Disable default interval polling; fixed NZ times are scheduled ourselves."""
+        return False
 
     async def async_added_to_hass(self) -> None:
         """
@@ -178,17 +249,154 @@ class WatercareUsageSensor(SensorEntity):
         alongside async_add_entities() in async_setup_entry so it can't
         possibly run before hass/entity_id are set on this entity -- HA
         only calls async_added_to_hass() once the entity is fully added
-        to the platform.
+        to the platform. The fetch itself is held back until Home Assistant
+        has finished starting (see _run_after_hass_started). Fixed-time
+        polling isn't scheduled here: the standing tick subscription is
+        registered once the initial backfill/update task finishes (see
+        _run_backfill/_run_initial_update), so the first scheduled poll
+        can't land mid-backfill; _update_lock additionally serializes any
+        update against a backfill regardless of who started them.
         """
         await super().async_added_to_hass()
         if self._needs_backfill:
             self._entry.async_create_background_task(
-                self.hass, self._run_backfill(), "watercare_history_backfill"
+                self.hass,
+                self._run_after_hass_started(self._run_backfill),
+                "watercare_history_backfill",
             )
         else:
             self._entry.async_create_background_task(
-                self.hass, self._run_initial_update(), "watercare_initial_update"
+                self.hass,
+                self._run_after_hass_started(self._run_initial_update),
+                "watercare_initial_update",
             )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel the standing poll subscription."""
+        await super().async_will_remove_from_hass()
+        if self._unsub_scheduled_poll is not None:
+            self._unsub_scheduled_poll()
+            # Clearing the handle also tells an in-flight
+            # _handle_scheduled_tick not to write state on this
+            # now-defunct entity.
+            self._unsub_scheduled_poll = None
+
+    def _is_data_fresh(self, now_nz: datetime) -> bool:
+        """
+        Whether the most recent update captured a complete previous NZ day.
+
+        Only halfhourly tracks this (see _bucket_hourly_readings) -- it's
+        the only endpoint whose publish timing has been characterized (see
+        POLL_START_HOUR_UTC); other endpoints poll on their fixed daily
+        slots instead of retrying for a signal they don't have. For
+        halfhourly, never having seen a complete day (fresh install, or
+        the in-memory date lost to a restart before a successful update)
+        counts as stale, so the retry ladder keeps trying rather than
+        leaving the sensor empty until the next day's start hour.
+        """
+        if self._endpoint != "halfhourly":
+            return True
+        if self._latest_reading_date is None:
+            return False
+        return self._latest_reading_date >= now_nz.date() - timedelta(days=1)
+
+    def _should_poll_now(self, now: datetime) -> bool:
+        """
+        Whether this quarter-hour tick (timezone-aware `now`) should hit the API.
+
+        Three reasons to poll: the endpoint's fixed daily slot(s); the
+        stale-retry ladder while the previous NZ day is incomplete; and
+        hourly recovery retries (any hour of day) after an update that got
+        no response at all, so a transient API/network failure doesn't
+        leave the sensor stale until the next fixed slot -- the
+        SCAN_INTERVAL polling this replaced recovered within 12h, and
+        hourly is the same idea with a tighter bound.
+
+        Slots are matched in UTC, the clock Watercare publishes on (see
+        POLL_START_HOUR_UTC); freshness is judged by NZ calendar day.
+        """
+        now_utc = now.astimezone(UTC)
+        slot = (now_utc.hour, now_utc.minute)
+        if self._last_update_failed and now_utc.minute == 0:
+            return True
+        if (
+            not self._is_data_fresh(now.astimezone(NZ_TIMEZONE))
+            and slot in POLL_RETRY_SLOTS_UTC
+        ):
+            return True
+        return slot in self._daily_poll_slots
+
+    def _schedule_polling(self) -> None:
+        """
+        Register the standing quarter-hour poll tick (idempotent).
+
+        One persistent async_track_time_change subscription instead of a
+        re-armed chain of one-shot timers: there is no per-fire re-arm
+        step whose failure could silently end all future polling, and no
+        timer to leak or orphan if scheduling or teardown ever races an
+        in-flight update. The tick fires at minutes 00/15/30/45 in HA's
+        configured timezone -- every real-world UTC offset is a multiple
+        of 15 minutes, so that grid coincides with the same UTC minutes no
+        matter where HA runs; the callback decides whether this tick is
+        one of the UTC poll slots (see _should_poll_now).
+        """
+        if self._unsub_scheduled_poll is not None:
+            return
+        self._unsub_scheduled_poll = async_track_time_change(
+            self.hass,
+            self._handle_scheduled_tick,
+            minute=list(QUARTER_HOUR_MINUTES),
+            second=0,
+        )
+
+    async def _handle_scheduled_tick(self, now: datetime) -> None:
+        # The unsub-handle guards cover teardown races: the subscription
+        # can fire one last time around entity removal, and an in-flight
+        # update can outlive async_will_remove_from_hass -- never write
+        # state on a defunct entity.
+        if self._unsub_scheduled_poll is None:
+            return
+        if not self._should_poll_now(now):
+            return
+        # Nothing awaits this callback, so failures must be caught and
+        # logged here rather than left to escape silently.
+        try:
+            await self.async_update()
+        except Exception:
+            _LOGGER.exception("Watercare scheduled update failed")
+        if self._unsub_scheduled_poll is not None:
+            self.async_write_ha_state()
+
+    async def _run_after_hass_started(
+        self, startup_job: Callable[[], Awaitable[None]]
+    ) -> None:
+        """
+        Run `startup_job` once Home Assistant has finished starting.
+
+        The recorder connects to its database early in startup but doesn't
+        process its write queue until EVENT_HOMEASSISTANT_STARTED, so
+        statistics pushed while HA is still starting just sit queued --
+        and _async_await_recorder_flush's timeout would expire (and warn
+        on every restart) whenever the rest of startup takes longer than
+        that, with nothing actually wrong with the recorder. Waiting here
+        instead means that timeout only ever measures a recorder that is
+        actually draining its queue. Returns straight away if HA is
+        already running (e.g. the config entry was reloaded).
+        """
+        started = asyncio.Event()
+
+        @callback
+        def _hass_started(_hass: HomeAssistant) -> None:
+            started.set()
+
+        unsub = async_at_started(self.hass, _hass_started)
+        try:
+            await started.wait()
+        finally:
+            # Unloading the config entry cancels this task; don't leave the
+            # listener behind on a defunct entity.
+            unsub()
+        await startup_job()
 
     async def _run_backfill(self) -> None:
         # Nothing awaits this background task, so an unhandled exception
@@ -210,18 +418,23 @@ class WatercareUsageSensor(SensorEntity):
             await self.async_update()
         except Exception:
             _LOGGER.exception("Watercare history backfill failed")
-        finally:
-            self.async_write_ha_state()
+        # Deliberately not a `finally`: unloading the config entry cancels
+        # this task, and the CancelledError (a BaseException, so not caught
+        # above) must skip both steps -- writing state on a removed entity
+        # and registering a polling subscription nothing would ever cancel.
+        self.async_write_ha_state()
+        self._schedule_polling()
 
     async def _run_initial_update(self) -> None:
         # See _run_backfill: nothing awaits this task, so failures need to
-        # be caught and logged here rather than left to escape silently.
+        # be caught and logged here, and cancellation must skip the
+        # post-steps below.
         try:
             await self.async_update()
         except Exception:
             _LOGGER.exception("Watercare initial update failed")
-        finally:
-            self.async_write_ha_state()
+        self.async_write_ha_state()
+        self._schedule_polling()
 
     @property
     def name(self) -> str:
@@ -313,47 +526,59 @@ class WatercareUsageSensor(SensorEntity):
 
     async def async_update(self) -> None:
         """Update the sensor data."""
-        _LOGGER.debug("Beginning sensor update using endpoint: %s", self._endpoint)
+        # The lock serializes this against a concurrently running deep
+        # backfill (see _update_lock); a poll landing mid-backfill would
+        # otherwise advance the statistics watermark past the backfill's
+        # older history.
+        async with self._update_lock:
+            _LOGGER.debug("Beginning sensor update using endpoint: %s", self._endpoint)
 
-        start_date = None
-        end_date = None
-        if self._endpoint == "halfhourly":
-            # Unlike the other endpoints, halfhourly has no server-side
-            # default range and 400s (INVALID_REQUEST_BODY) without one.
-            today = datetime.now(NZ_TIMEZONE).date()
-            start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-            end_date = today.strftime("%Y-%m-%d")
-        elif self._endpoint in ("dailywithstats", "monthly"):
-            # These also have no server-side default range and 400 without
-            # one, but (unlike halfhourly) aren't capped by request span and
-            # their processing recomputes cumulative sums from the full
-            # response each poll, so request the full history span.
-            today = datetime.now(NZ_TIMEZONE).date()
-            start_date = (today - timedelta(days=FULL_HISTORY_LOOKBACK_DAYS)).strftime(
-                "%Y-%m-%d"
+            start_date = None
+            end_date = None
+            if self._endpoint == "halfhourly":
+                # Unlike the other endpoints, halfhourly has no server-side
+                # default range and 400s (INVALID_REQUEST_BODY) without one.
+                today = datetime.now(NZ_TIMEZONE).date()
+                start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+                end_date = today.strftime("%Y-%m-%d")
+            elif self._endpoint in ("dailywithstats", "monthly"):
+                # These also have no server-side default range and 400 without
+                # one, but (unlike halfhourly) aren't capped by request span and
+                # their processing recomputes cumulative sums from the full
+                # response each poll, so request the full history span.
+                today = datetime.now(NZ_TIMEZONE).date()
+                start_date = (
+                    today - timedelta(days=FULL_HISTORY_LOOKBACK_DAYS)
+                ).strftime("%Y-%m-%d")
+                end_date = today.strftime("%Y-%m-%d")
+
+            # Assume failure until a response actually arrives, so an
+            # exception anywhere in the fetch also leaves the flag set and
+            # _should_poll_now schedules hourly recovery retries.
+            self._last_update_failed = True
+            response = await self._api.get_data(
+                endpoint=self._endpoint, start_date=start_date, end_date=end_date
             )
-            end_date = today.strftime("%Y-%m-%d")
+            if response is not None:
+                self._last_update_failed = False
 
-        response = await self._api.get_data(
-            endpoint=self._endpoint, start_date=start_date, end_date=end_date
-        )
-
-        # Route to appropriate processing method based on endpoint
-        if self._endpoint == "dailywithstats":
-            await self.process_daily_data(response)
-        elif self._endpoint == "halfhourly":
-            # halfhourly returns a bare list of {timestamp, litres} readings,
-            # not billing periods or a dailywithstats-style wrapper.
-            await self.process_halfhourly_data(response)
-        elif self._endpoint == "monthly":
-            # monthly returns one entry per calendar month --
-            # {timestamp, litres, numberOfMissingDays, statistics} -- not
-            # billing periods, so it needs its own processing too.
-            await self.process_monthly_data(response)
-        else:
-            # mechanicalmonthly has its own server-side default range and
-            # returns real billing periods.
-            await self.process_data(response)
+            # Route to appropriate processing method based on endpoint
+            if self._endpoint == "dailywithstats":
+                await self.process_daily_data(response)
+            elif self._endpoint == "halfhourly":
+                # halfhourly returns a bare list of {timestamp, litres}
+                # readings, not billing periods or a dailywithstats-style
+                # wrapper.
+                await self.process_halfhourly_data(response)
+            elif self._endpoint == "monthly":
+                # monthly returns one entry per calendar month --
+                # {timestamp, litres, numberOfMissingDays, statistics} -- not
+                # billing periods, so it needs its own processing too.
+                await self.process_monthly_data(response)
+            else:
+                # mechanicalmonthly has its own server-side default range and
+                # returns real billing periods.
+                await self.process_data(response)
 
     async def process_data(self, response: str | None) -> None:
         """Process the API response."""
@@ -653,29 +878,68 @@ class WatercareUsageSensor(SensorEntity):
             empty_warning=None,
         )
 
+    @staticmethod
+    def _parse_reading_time(timestamp_str: str | None) -> datetime | None:
+        """Parse a halfhourly reading's UTC API timestamp into NZ local time."""
+        if not timestamp_str:
+            return None
+        try:
+            reading_time = datetime.strptime(
+                timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=UTC)
+        except ValueError:
+            _LOGGER.warning("Failed to parse timestamp %s", timestamp_str)
+            return None
+        return reading_time.astimezone(NZ_TIMEZONE)
+
     def _bucket_hourly_readings(
         self, readings: list[dict[str, Any]]
-    ) -> dict[datetime, float]:
-        """Bucket a list of {timestamp, litres} readings into hourly sums."""
+    ) -> tuple[dict[datetime, float], date_type | None]:
+        """
+        Bucket a list of {timestamp, litres} readings into hourly sums.
+
+        Also returns the latest NZ date whose halfhourly data is confirmed
+        fully published, computed in the same pass over `readings` rather
+        than re-parsing timestamps separately (this can run on years of
+        backfilled readings, not just a single poll's response). A day
+        only counts as complete once its final half-hour slot (23:30 NZT)
+        has been published -- an earlier partial reading for "today" (e.g.
+        23:00 with no 23:30 yet, as seen live: Watercare briefly published
+        a 23:00-only reading before 23:30 landed 15 min later) must not be
+        mistaken for a complete day, or _is_data_fresh would stop retrying
+        before the last half-hour actually arrives.
+        """
         hourly_consumption: dict[datetime, float] = {}
+        complete_dates: set[date_type] = set()
         for reading in readings:
-            timestamp_str = reading.get("timestamp")
-            if not timestamp_str:
+            reading_time = self._parse_reading_time(reading.get("timestamp"))
+            if reading_time is None:
                 continue
-            try:
-                reading_time = datetime.strptime(
-                    timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ"
-                ).replace(tzinfo=UTC)
-            except ValueError:
-                _LOGGER.warning("Failed to parse timestamp %s", timestamp_str)
-                continue
-            reading_time = reading_time.astimezone(NZ_TIMEZONE)
             hour_start = reading_time.replace(minute=0, second=0, microsecond=0)
             litres = reading.get("litres", 0)
             hourly_consumption[hour_start] = (
                 hourly_consumption.get(hour_start, 0) + litres
             )
-        return hourly_consumption
+            if (reading_time.hour, reading_time.minute) == (23, 30):
+                complete_dates.add(reading_time.date())
+        return hourly_consumption, max(complete_dates, default=None)
+
+    def _advance_latest_reading_date(
+        self, latest_complete_date: date_type | None
+    ) -> None:
+        """
+        Advance the freshness watermark, never regressing it.
+
+        A response with no confirmed-complete day, or one older than
+        what's already known (e.g. a truncated/narrower window than
+        expected), must not regress an already-known complete date and
+        re-trigger retries for a day that was already captured.
+        """
+        if latest_complete_date is not None and (
+            self._latest_reading_date is None
+            or latest_complete_date > self._latest_reading_date
+        ):
+            self._latest_reading_date = latest_complete_date
 
     async def _async_last_statistic_sum(
         self, statistic_id: str
@@ -812,7 +1076,9 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.warning("No halfhourly readings found")
             return
 
-        hourly_consumption = self._bucket_hourly_readings(readings)
+        hourly_consumption, latest_complete_date = self._bucket_hourly_readings(
+            readings
+        )
         if not hourly_consumption:
             _LOGGER.warning("No valid halfhourly readings found")
             return
@@ -838,7 +1104,32 @@ class WatercareUsageSensor(SensorEntity):
             "cost_currency": "NZD",
         }
 
-        await self._async_push_halfhourly_statistics(hourly_consumption)
+        # Only push statistics for confirmed-complete days. A poll that
+        # catches Watercare mid-publish (observed live: the 06:14 poll saw
+        # yesterday up to 23:00 with no 23:30 yet) would otherwise write a
+        # partial trailing-hour bucket and advance the append-only
+        # watermark past it, permanently excluding the late-arriving
+        # half-hour's litres from the cumulative sums. Deferred days are
+        # re-fetched by the retry ladder (and the 7-day request window)
+        # once complete.
+        if latest_complete_date is None:
+            _LOGGER.warning(
+                "Halfhourly response contained no confirmed-complete day; "
+                "deferring statistics push until one appears"
+            )
+            return
+        complete_day_buckets = {
+            hour: litres
+            for hour, litres in hourly_consumption.items()
+            if hour.date() <= latest_complete_date
+        }
+        await self._async_push_halfhourly_statistics(complete_day_buckets)
+
+        # Advance the freshness watermark only now that the push has
+        # succeeded -- a failed push must leave the day stale so the retry
+        # ladder re-attempts it instead of stopping for the day with
+        # yesterday's statistics unwritten.
+        self._advance_latest_reading_date(latest_complete_date)
 
     async def async_backfill_halfhourly_history(self) -> None:
         """
@@ -848,6 +1139,15 @@ class WatercareUsageSensor(SensorEntity):
         requested range (it always starts exactly at the requested `from`
         date), so this pages backward in fixed-size chunks.
         """
+        # The lock serializes this against regular updates: the paging
+        # below takes many seconds, and a scheduled poll (or the
+        # watercare.backfill_history service racing one) landing mid-way
+        # would push current-window buckets and advance the append-only
+        # watermark, silently discarding this older history.
+        async with self._update_lock:
+            await self._async_backfill_halfhourly_history_locked()
+
+    async def _async_backfill_halfhourly_history_locked(self) -> None:
         _LOGGER.info("Starting Watercare halfhourly history backfill")
         today = datetime.now(NZ_TIMEZONE).date()
         chunk_end = today
@@ -900,12 +1200,29 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.warning("Backfill found no historical data")
             return
 
-        hourly_consumption = self._bucket_hourly_readings(
+        hourly_consumption, latest_complete_date = self._bucket_hourly_readings(
             [
                 {"timestamp": timestamp, "litres": litres}
                 for timestamp, litres in all_readings.items()
             ]
         )
+        # Same partial-day guard as process_halfhourly_data: a backfill run
+        # mid-publish must not write an incomplete trailing hour that the
+        # append-only watermark would then lock in. No complete day at all
+        # (e.g. a brand-new meter whose only history is today's first few
+        # hours) defers the push entirely -- regular polling will write it
+        # once a complete day exists.
+        if latest_complete_date is None:
+            _LOGGER.warning(
+                "Backfill collected no confirmed-complete day; deferring "
+                "statistics push until one appears"
+            )
+            return
+        hourly_consumption = {
+            hour: litres
+            for hour, litres in hourly_consumption.items()
+            if hour.date() <= latest_complete_date
+        }
 
         # Pushing is append-only (see _async_push_hourly_statistic): it only
         # writes hours after the statistic's existing watermark. If regular
@@ -930,6 +1247,11 @@ class WatercareUsageSensor(SensorEntity):
             )
 
         new_count = await self._async_push_halfhourly_statistics(hourly_consumption)
+        # Seed the freshness watermark from what the backfill actually
+        # observed (after the push, mirroring process_halfhourly_data), so
+        # a failed post-backfill regular update doesn't leave the sensor
+        # thinking it has never seen a complete day.
+        self._advance_latest_reading_date(latest_complete_date)
         if new_count:
             _LOGGER.info(
                 "Backfill complete: wrote %s new hourly buckets (of %s collected)",
