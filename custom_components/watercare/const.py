@@ -21,6 +21,26 @@ CONF_WASTEWATER_RATIO = "wastewater_ratio"
 CONF_ANNUAL_LINE_CHARGE = "annual_line_charge"
 CONF_ENDPOINT = "endpoint"
 CONF_HISTORY_BACKFILLED = "history_backfilled"
+CONF_ACCOUNT_NUMBER = "account_number"
+# Set on the account subentry migrated from a pre-subentry (v1) entry: it
+# keeps the original account-less entity unique_id and statistic ids, so
+# existing history and Energy dashboard configuration carry over. Accounts
+# added afterwards get account-specific ids.
+CONF_LEGACY_IDS = "legacy_ids"
+
+SUBENTRY_TYPE_ACCOUNT = "account"
+
+# Account subentry settings that, when changed, need the entry reloaded to
+# take effect -- as opposed to bookkeeping the integration writes back at
+# runtime (CONF_HISTORY_BACKFILLED, a resolved CONF_ACCOUNT_NUMBER), which
+# must not trigger a reload.
+ACCOUNT_SETTINGS_KEYS = (
+    CONF_ENDPOINT,
+    CONF_CONSUMPTION_RATE,
+    CONF_WASTEWATER_RATE,
+    CONF_WASTEWATER_RATIO,
+    CONF_ANNUAL_LINE_CHARGE,
+)
 
 # Default cost rate per 1000L (NZD) - typical NZ Watercare rates
 DEFAULT_CONSUMPTION_RATE = 2.296  # $2.296 per 1000L

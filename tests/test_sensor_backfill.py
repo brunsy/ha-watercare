@@ -116,6 +116,45 @@ async def test_backfill_warns_when_existing_watermark_blocks_older_data(
     assert any("won't be written" in message for message in caplog.messages)
 
 
+async def test_backfill_warns_against_this_accounts_own_statistics(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Regression: the "won't be written" check must use the account-scoped id.
+
+    It used to check the account-less watercare:halfhourly_consumption,
+    so an account added as a subentry was judged by the migrated account's
+    statistics (or none at all) instead of its own.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._legacy_ids = False
+    sensor._account_number = "0012345-02"
+    sensor._api.get_data = AsyncMock(side_effect=[COMPLETE_CHUNK_RESPONSE, "[]"])
+
+    readings = json.loads(COMPLETE_CHUNK_RESPONSE)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
+    newest_bucket = max(buckets)
+    for name in (
+        "halfhourly_consumption",
+        "halfhourly_cost",
+        "halfhourly_consumption_cost",
+        "halfhourly_wastewater_cost",
+    ):
+        patch_recorder.last_statistics[f"watercare:0012345_02_{name}"] = (
+            999.0,
+            newest_bucket.timestamp(),
+        )
+
+    with caplog.at_level(logging.WARNING):
+        await sensor.async_backfill_halfhourly_history()
+
+    assert patch_recorder.written == {}
+    warning = next(m for m in caplog.messages if "won't be written" in m)
+    assert "watercare:0012345_02_halfhourly_consumption" in warning
+
+
 async def test_backfill_defers_push_when_no_complete_day_observed(
     make_sensor: Callable[..., WatercareUsageSensor],
     patch_recorder: SimpleNamespace,

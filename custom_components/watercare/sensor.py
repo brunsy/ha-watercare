@@ -7,6 +7,7 @@ import calendar
 import json
 import logging
 import math
+import re
 from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
 from typing import TYPE_CHECKING, Any
@@ -16,16 +17,19 @@ from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.start import async_at_started
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .api import WatercareAuthError
 from .const import (
+    CONF_ACCOUNT_NUMBER,
     CONF_ANNUAL_LINE_CHARGE,
     CONF_CONSUMPTION_RATE,
     CONF_ENDPOINT,
     CONF_HISTORY_BACKFILLED,
+    CONF_LEGACY_IDS,
     CONF_WASTEWATER_RATE,
     CONF_WASTEWATER_RATIO,
     DEFAULT_ANNUAL_LINE_CHARGE,
@@ -38,13 +42,14 @@ from .const import (
     NZ_TIMEZONE,
     SENSOR_NAME,
     STATISTIC_TYPES,
+    SUBENTRY_TYPE_ACCOUNT,
 )
 from .statistics_helpers import accumulate_cost_series, push_statistic_series
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from homeassistant.config_entries import ConfigEntry
+    from homeassistant.config_entries import ConfigEntry, ConfigSubentry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -142,53 +147,44 @@ async def async_setup_entry(
         return False
 
     api = entry_data["api"]
+    entry_data["sensors"] = {}
 
-    # Get rates and endpoint from config entry data
-    consumption_rate = entry.data.get(CONF_CONSUMPTION_RATE, DEFAULT_CONSUMPTION_RATE)
-    wastewater_rate = entry.data.get(CONF_WASTEWATER_RATE, DEFAULT_WASTEWATER_RATE)
-    wastewater_ratio = entry.data.get(CONF_WASTEWATER_RATIO, DEFAULT_WASTEWATER_RATIO)
-    annual_line_charge = entry.data.get(
-        CONF_ANNUAL_LINE_CHARGE, DEFAULT_ANNUAL_LINE_CHARGE
-    )
-    endpoint = entry.data.get(CONF_ENDPOINT, DEFAULT_ENDPOINT)
-
-    # Check for updated values in options
-    if entry.options:
-        consumption_rate = entry.options.get(CONF_CONSUMPTION_RATE, consumption_rate)
-        wastewater_rate = entry.options.get(CONF_WASTEWATER_RATE, wastewater_rate)
-        wastewater_ratio = entry.options.get(CONF_WASTEWATER_RATIO, wastewater_ratio)
-        annual_line_charge = entry.options.get(
-            CONF_ANNUAL_LINE_CHARGE, annual_line_charge
+    # One sensor per account subentry, each with its own data source and
+    # rates (see config_flow.AccountSubentryFlow).
+    for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ACCOUNT):
+        data = subentry.data
+        endpoint = data.get(CONF_ENDPOINT, DEFAULT_ENDPOINT)
+        sensor = WatercareUsageSensor(
+            SENSOR_NAME,
+            api,
+            data.get(CONF_CONSUMPTION_RATE, DEFAULT_CONSUMPTION_RATE),
+            data.get(CONF_WASTEWATER_RATE, DEFAULT_WASTEWATER_RATE),
+            data.get(CONF_WASTEWATER_RATIO, DEFAULT_WASTEWATER_RATIO),
+            data.get(CONF_ANNUAL_LINE_CHARGE, DEFAULT_ANNUAL_LINE_CHARGE),
+            endpoint,
+            entry,
+            needs_backfill=endpoint == "halfhourly"
+            and not data.get(CONF_HISTORY_BACKFILLED),
+            subentry=subentry,
+            account_number=data.get(CONF_ACCOUNT_NUMBER),
+            legacy_ids=bool(data.get(CONF_LEGACY_IDS)),
         )
-        endpoint = entry.options.get(CONF_ENDPOINT, endpoint)
+        entry_data["sensors"][subentry.subentry_id] = sensor
 
-    needs_backfill = endpoint == "halfhourly" and not entry.data.get(
-        CONF_HISTORY_BACKFILLED
-    )
-
-    sensor = WatercareUsageSensor(
-        SENSOR_NAME,
-        api,
-        consumption_rate,
-        wastewater_rate,
-        wastewater_ratio,
-        annual_line_charge,
-        endpoint,
-        entry,
-        needs_backfill=needs_backfill,
-    )
-    entry_data["sensor"] = sensor
-
-    # Never block platform setup on update_before_add: the first update
-    # requires a full OAuth login (get_refresh_token() alone chains 4
-    # sequential HTTP round-trips to the Azure B2C login pages, plus
-    # get_accounts() and the usage request itself), which routinely takes
-    # long enough to trip HA's "setup is taking over 10 seconds" warning.
-    # Add the entity immediately -- it kicks off its own first update from
-    # async_added_to_hass() once hass/entity_id are actually set, rather
-    # than from a background task started here that could theoretically
-    # race the entity's own add-to-platform sequence.
-    async_add_entities([sensor], update_before_add=False)
+        # Never block platform setup on update_before_add: the first update
+        # requires a full OAuth login (get_refresh_token() alone chains 4
+        # sequential HTTP round-trips to the Azure B2C login pages, plus the
+        # usage request itself), which routinely takes long enough to trip
+        # HA's "setup is taking over 10 seconds" warning. Add the entity
+        # immediately -- it kicks off its own first update from
+        # async_added_to_hass() once hass/entity_id are actually set, rather
+        # than from a background task started here that could theoretically
+        # race the entity's own add-to-platform sequence.
+        async_add_entities(
+            [sensor],
+            update_before_add=False,
+            config_subentry_id=subentry.subentry_id,
+        )
 
     return True
 
@@ -208,13 +204,25 @@ class WatercareUsageSensor(SensorEntity):
         entry: ConfigEntry,
         *,
         needs_backfill: bool,
+        subentry: ConfigSubentry | None = None,
+        account_number: str | None = None,
+        legacy_ids: bool = True,
     ) -> None:
-        """Initialize Watercare Usage sensor."""
-        self._name = name
+        """
+        Initialize Watercare Usage sensor.
+
+        legacy_ids keeps the pre-subentry, account-less unique_id and
+        statistic ids (see CONF_LEGACY_IDS); otherwise both include
+        account_number, so several accounts can coexist.
+        """
+        self._subentry = subentry
+        self._account_number = account_number
+        self._legacy_ids = legacy_ids
+        self._name = name if legacy_ids else f"{name} {account_number}"
         self._icon = "mdi:water"
         self._state = None
         self._unit_of_measurement = "L"
-        self._unique_id = DOMAIN
+        self._unique_id = DOMAIN if legacy_ids else f"{DOMAIN}_{account_number}"
         self._device_class = "water"
         # halfhourly's entity state is "today's consumption so far" and
         # monthly's is "this month's consumption so far" -- both reset
@@ -440,8 +448,10 @@ class WatercareUsageSensor(SensorEntity):
             # cause the backfill's data to be silently discarded as
             # already-superseded.
             await self.async_backfill_halfhourly_history()
-            self.hass.config_entries.async_update_entry(
-                self._entry, data={**self._entry.data, CONF_HISTORY_BACKFILLED: True}
+            self.hass.config_entries.async_update_subentry(
+                self._entry,
+                self._subentry,
+                data={**self._subentry.data, CONF_HISTORY_BACKFILLED: True},
             )
             await self.async_update()
         except Exception:
@@ -504,6 +514,11 @@ class WatercareUsageSensor(SensorEntity):
         """Return the unique id."""
         return self._unique_id
 
+    @property
+    def endpoint(self) -> str:
+        """Return the data source (API endpoint) this sensor polls."""
+        return self._endpoint
+
     def _calculate_cost(
         self, usage_litres: float, number_of_days: float
     ) -> dict[str, float]:
@@ -550,7 +565,22 @@ class WatercareUsageSensor(SensorEntity):
             self._endpoint, self._endpoint.title()
         )
         type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
-        return f"Watercare {endpoint_name} {type_name}"
+        return self._statistic_label(f"Watercare {endpoint_name} {type_name}")
+
+    def _statistic_id(self, name: str) -> str:
+        """Return the external statistic id for `name`, scoped to the account."""
+        if self._legacy_ids:
+            return f"{DOMAIN}:{name}"
+        # Statistic ids only allow lowercase letters, digits and single
+        # underscores; account numbers contain hyphens ("0012345-02").
+        account_slug = re.sub(r"[^0-9a-z]+", "_", str(self._account_number).lower())
+        return f"{DOMAIN}:{account_slug.strip('_')}_{name}"
+
+    def _statistic_label(self, label: str) -> str:
+        """Return a statistic's display name, tagged with the account if scoped."""
+        if self._legacy_ids:
+            return label
+        return f"{label} ({self._account_number})"
 
     async def _get_data(
         self, endpoint: str, start_date: str | None, end_date: str | None
@@ -567,7 +597,10 @@ class WatercareUsageSensor(SensorEntity):
         """
         try:
             response = await self._api.get_data(
-                endpoint=endpoint, start_date=start_date, end_date=end_date
+                endpoint=endpoint,
+                start_date=start_date,
+                end_date=end_date,
+                account_number=self._account_number,
             )
         except WatercareAuthError as err:
             # Rejected credentials aren't transient -- don't leave the
@@ -587,7 +620,39 @@ class WatercareUsageSensor(SensorEntity):
             # endpoint) also returns None without raising, and must not be
             # mistaken for recovery.
             self._reauth_started = False
+            self._async_store_resolved_account_number()
         return response
+
+    @callback
+    def _async_store_resolved_account_number(self) -> None:
+        """
+        Record which account a migrated subentry has actually been polling.
+
+        The subentry migrated from a pre-subentry entry starts without an
+        account number and polls the login's first account; storing it makes
+        that explicit, and (as the subentry's unique_id) stops the same
+        account being added a second time as a separate subentry.
+        """
+        if self._account_number or self._subentry is None:
+            return
+        account_number = self._api.default_account_number
+        if not account_number:
+            return
+        self._account_number = account_number
+        try:
+            self.hass.config_entries.async_update_subentry(
+                self._entry,
+                self._subentry,
+                data={**self._subentry.data, CONF_ACCOUNT_NUMBER: account_number},
+                title=account_number,
+                unique_id=account_number,
+            )
+        except AbortFlow:
+            _LOGGER.warning(
+                "Watercare account %s is also set up as a separate account; "
+                "remove one of them to avoid importing its usage twice",
+                account_number,
+            )
 
     async def async_update(self) -> None:
         """Update the sensor data."""
@@ -767,8 +832,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             consumption_points,
-            statistic_id=f"{DOMAIN}:water_consumption",
-            name="Watercare Water Consumption",
+            statistic_id=self._statistic_id("water_consumption"),
+            name=self._statistic_label("Watercare Water Consumption"),
             unit=self._unit_of_measurement,
             unit_class=VolumeConverter.UNIT_CLASS,
             empty_warning="No valid consumption statistics generated",
@@ -776,8 +841,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             cost_points,
-            statistic_id=f"{DOMAIN}:water_cost",
-            name="Watercare Total Cost",
+            statistic_id=self._statistic_id("water_cost"),
+            name=self._statistic_label("Watercare Total Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning="No valid cost statistics generated",
@@ -785,8 +850,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             consumption_cost_points,
-            statistic_id=f"{DOMAIN}:consumption_cost",
-            name="Watercare Consumption Cost",
+            statistic_id=self._statistic_id("consumption_cost"),
+            name=self._statistic_label("Watercare Consumption Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
@@ -794,8 +859,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             wastewater_cost_points,
-            statistic_id=f"{DOMAIN}:wastewater_cost",
-            name="Watercare Wastewater Cost",
+            statistic_id=self._statistic_id("wastewater_cost"),
+            name=self._statistic_label("Watercare Wastewater Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
@@ -919,7 +984,7 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             consumption_points,
-            statistic_id=f"{DOMAIN}:monthly_consumption",
+            statistic_id=self._statistic_id("monthly_consumption"),
             name=self._get_statistic_name("consumption"),
             unit=self._unit_of_measurement,
             unit_class=VolumeConverter.UNIT_CLASS,
@@ -928,8 +993,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             cost_points,
-            statistic_id=f"{DOMAIN}:monthly_cost",
-            name="Watercare Monthly Cost",
+            statistic_id=self._statistic_id("monthly_cost"),
+            name=self._statistic_label("Watercare Monthly Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning="No valid monthly cost statistics generated",
@@ -937,8 +1002,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             consumption_cost_points,
-            statistic_id=f"{DOMAIN}:monthly_consumption_cost",
-            name="Watercare Monthly Consumption Cost",
+            statistic_id=self._statistic_id("monthly_consumption_cost"),
+            name=self._statistic_label("Watercare Monthly Consumption Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
@@ -946,8 +1011,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             wastewater_cost_points,
-            statistic_id=f"{DOMAIN}:monthly_wastewater_cost",
-            name="Watercare Monthly Wastewater Cost",
+            statistic_id=self._statistic_id("monthly_wastewater_cost"),
+            name=self._statistic_label("Watercare Monthly Wastewater Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
@@ -1353,7 +1418,7 @@ class WatercareUsageSensor(SensorEntity):
         touched_hours: set[datetime] | None = set() if heal_since is not None else None
         new_count = await self._async_push_hourly_statistic(
             hourly_consumption,
-            statistic_id=f"{DOMAIN}:halfhourly_consumption",
+            statistic_id=self._statistic_id("halfhourly_consumption"),
             name=self._get_statistic_name("consumption"),
             unit=self._unit_of_measurement,
             cost_key=None,
@@ -1365,8 +1430,8 @@ class WatercareUsageSensor(SensorEntity):
         await asyncio.gather(
             self._async_push_hourly_statistic(
                 hourly_consumption,
-                statistic_id=f"{DOMAIN}:halfhourly_cost",
-                name="Watercare Half-hourly Cost",
+                statistic_id=self._statistic_id("halfhourly_cost"),
+                name=self._statistic_label("Watercare Half-hourly Cost"),
                 unit="NZD",
                 cost_key="total",
                 rate_gate=None,
@@ -1375,8 +1440,8 @@ class WatercareUsageSensor(SensorEntity):
             ),
             self._async_push_hourly_statistic(
                 hourly_consumption,
-                statistic_id=f"{DOMAIN}:halfhourly_consumption_cost",
-                name="Watercare Half-hourly Consumption Cost",
+                statistic_id=self._statistic_id("halfhourly_consumption_cost"),
+                name=self._statistic_label("Watercare Half-hourly Consumption Cost"),
                 unit="NZD",
                 cost_key="consumption",
                 rate_gate=self._consumption_rate,
@@ -1385,8 +1450,8 @@ class WatercareUsageSensor(SensorEntity):
             ),
             self._async_push_hourly_statistic(
                 hourly_consumption,
-                statistic_id=f"{DOMAIN}:halfhourly_wastewater_cost",
-                name="Watercare Half-hourly Wastewater Cost",
+                statistic_id=self._statistic_id("halfhourly_wastewater_cost"),
+                name=self._statistic_label("Watercare Half-hourly Wastewater Cost"),
                 unit="NZD",
                 cost_key="wastewater",
                 rate_gate=self._wastewater_rate,
@@ -1575,9 +1640,8 @@ class WatercareUsageSensor(SensorEntity):
         # polling has already run and advanced that watermark, none of this
         # deep-history data -- which is by definition older -- can actually
         # be written, even though the API calls above succeeded.
-        _, last_start = await self._async_last_statistic_sum(
-            f"{DOMAIN}:halfhourly_consumption"
-        )
+        consumption_statistic_id = self._statistic_id("halfhourly_consumption")
+        _, last_start = await self._async_last_statistic_sum(consumption_statistic_id)
         oldest_collected = min(hourly_consumption)
         if last_start is not None and oldest_collected.timestamp() <= last_start:
             _LOGGER.warning(
@@ -1585,11 +1649,12 @@ class WatercareUsageSensor(SensorEntity):
                 "halfhourly statistics already start at or before that point "
                 "(from regular polling) -- history is only ever appended after "
                 "the latest stored hour, so this older data won't be written. "
-                "To re-import deeper history, clear the watercare:halfhourly_* "
-                "statistics first (Developer tools > Statistics) and re-run "
-                "this service",
+                "To re-import deeper history, clear this account's halfhourly "
+                "statistics (%s and its cost series) first (Developer tools > "
+                "Statistics) and re-run this service",
                 len(hourly_consumption),
                 oldest_collected,
+                consumption_statistic_id,
             )
 
         new_count = await self._async_push_halfhourly_statistics(hourly_consumption)
@@ -1697,7 +1762,7 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             consumption_points,
-            statistic_id=f"{DOMAIN}:daily_consumption",
+            statistic_id=self._statistic_id("daily_consumption"),
             name=self._get_statistic_name("consumption"),
             unit=self._unit_of_measurement,
             unit_class=VolumeConverter.UNIT_CLASS,
@@ -1706,8 +1771,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             cost_points,
-            statistic_id=f"{DOMAIN}:daily_cost",
-            name="Watercare Daily Cost",
+            statistic_id=self._statistic_id("daily_cost"),
+            name=self._statistic_label("Watercare Daily Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
@@ -1715,8 +1780,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             consumption_cost_points,
-            statistic_id=f"{DOMAIN}:daily_consumption_cost",
-            name="Watercare Daily Consumption Cost",
+            statistic_id=self._statistic_id("daily_consumption_cost"),
+            name=self._statistic_label("Watercare Daily Consumption Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
@@ -1724,8 +1789,8 @@ class WatercareUsageSensor(SensorEntity):
         push_statistic_series(
             self.hass,
             wastewater_cost_points,
-            statistic_id=f"{DOMAIN}:daily_wastewater_cost",
-            name="Watercare Daily Wastewater Cost",
+            statistic_id=self._statistic_id("daily_wastewater_cost"),
+            name=self._statistic_label("Watercare Daily Wastewater Cost"),
             unit="NZD",
             unit_class=None,
             empty_warning=None,
