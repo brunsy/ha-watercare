@@ -4,7 +4,10 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-# Install common requirements (pip) first so any pip upgrade completes
-# before the rest of the dependencies are installed.
-python3 -m pip install --requirement requirements_common.txt
-python3 -m pip install --requirement requirements_dev.txt
+# The devcontainer only provides Python; bootstrap uv from PyPI if it isn't
+# already installed.
+command -v uv >/dev/null || python3 -m pip install uv
+
+# Creates .venv and installs the default (dev) dependency group, which
+# includes the lint and test groups, exactly as pinned in uv.lock.
+uv sync --locked

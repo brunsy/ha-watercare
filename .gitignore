@@ -16,3 +16,6 @@ coverage.xml
 config/*
 !config/configuration.yaml
 .DS_Store
+
+# uv
+.venv

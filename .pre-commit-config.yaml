@@ -1,6 +1,6 @@
 # Mirrors the CI "Lint" workflow (.github/workflows/lint.yml) exactly:
-# `ruff check .` and `ruff format . --check`, using whatever `ruff` is on
-# PATH (pinned via requirements_lint.txt) rather than a separately-managed
+# `ruff check .` and `ruff format . --check`, using the ruff pinned in the
+# uv lint dependency group (via `uv run`) rather than a separately-managed
 # pre-commit venv, so there's no risk of drifting from the version CI uses.
 #
 # Both hooks are intentionally non-mutating (--check, no --fix) instead of
@@ -16,13 +16,13 @@ repos:
     hooks:
       - id: ruff-check
         name: ruff check
-        entry: python3 -m ruff check .
+        entry: uv run ruff check .
         language: system
         pass_filenames: false
         types: [python]
       - id: ruff-format
         name: ruff format --check
-        entry: python3 -m ruff format . --check
+        entry: uv run ruff format . --check
         language: system
         pass_filenames: false
         types: [python]
