@@ -1,29 +1,33 @@
-name: "Lint"
+name: Lint
 
 on:
   push:
     branches:
       - "main"
   pull_request:
-    branches:
-      - "main"
+
+permissions: {}
 
 jobs:
   ruff:
     name: "Ruff"
     runs-on: "ubuntu-latest"
     steps:
-        - name: "Checkout the repository"
-          uses: "actions/checkout@v4.1.0"
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-        - name: "Set up Python"
-          uses: actions/setup-python@v5.0.0
-          with:
-            python-version: "3.11"
-            cache: "pip"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
 
-        - name: "Install requirements"
-          run: python3 -m pip install -r requirements.txt
+      - name: Install requirements
+        run: uv sync --locked --only-group lint
 
-        - name: "Run"
-          run: python3 -m ruff check .
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Format
+        run: uv run --no-sync ruff format . --check

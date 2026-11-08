@@ -1,0 +1,20 @@
+{
+  "usage": [
+    {"timestamp": "2026-08-05T13:00:00.000Z", "litres": 210},
+    {"timestamp": "2026-08-05T20:00:00.000Z", "litres": 190},
+    {"timestamp": "2026-08-06T09:00:00.000Z", "litres": 260},
+    {"timestamp": "2026-08-06T21:00:00.000Z", "litres": 240},
+    {"timestamp": "2026-08-07T08:00:00.000Z", "litres": 300}
+  ],
+  "statistics": {
+    "currentPeriodAverage": 98,
+    "differenceToPreviousPeriod": -8,
+    "efficiency": {
+      "currentHouseholdBand": 1,
+      "usageToLowerBand": 0
+    }
+  },
+  "accountBalance": -12.3,
+  "amountDue": 0,
+  "readingType": "Actual"
+}

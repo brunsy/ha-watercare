@@ -1,0 +1,106 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sign in to Watercare",
+        "description": "Use the email and password you use for the Watercare mobile app. You'll add accounts next.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "account": {
+        "title": "Add a Watercare account",
+        "description": "Choose the first account to track. You can add more later with \"Add account\".",
+        "data": {
+          "account_number": "Account",
+          "endpoint": "Data source",
+          "consumption_rate": "Water consumption rate ($ per 1000 L)",
+          "wastewater_rate": "Wastewater rate ($ per 1000 L)",
+          "wastewater_ratio": "Wastewater ratio",
+          "annual_line_charge": "Annual line charge ($)"
+        },
+        "data_description": {
+          "account_number": "Pick an account, or type the number from your bill if it isn't listed."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with Watercare",
+        "description": "Watercare rejected the saved credentials. Enter the email and password you use for the Watercare mobile app.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Update Watercare sign-in",
+        "description": "Change the password used to sign in. To change an account's data source or rates, reconfigure that account instead.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Watercare rejected the email or password.",
+      "cannot_connect": "Couldn't reach Watercare. Try again later.",
+      "unknown": "Unexpected error while signing in to Watercare. Check the logs for details.",
+      "invalid_account_number": "Enter the account number as shown on your bill, e.g. 0012345-02.",
+      "account_already_configured": "This account is already set up."
+    },
+    "abort": {
+      "already_configured": "This Watercare login is already set up.",
+      "reauth_successful": "Re-authentication was successful.",
+      "reconfigure_successful": "Watercare sign-in was updated.",
+      "wrong_account": "That's a different Watercare login. Add it as a new integration entry instead."
+    }
+  },
+  "config_subentries": {
+    "account": {
+      "entry_type": "Account",
+      "initiate_flow": {
+        "user": "Add account"
+      },
+      "step": {
+        "user": {
+          "title": "Add a Watercare account",
+          "description": "Choose an account on this login that isn't tracked yet.",
+          "data": {
+            "account_number": "Account",
+            "endpoint": "Data source",
+            "consumption_rate": "Water consumption rate ($ per 1000 L)",
+            "wastewater_rate": "Wastewater rate ($ per 1000 L)",
+            "wastewater_ratio": "Wastewater ratio",
+            "annual_line_charge": "Annual line charge ($)"
+          },
+          "data_description": {
+            "account_number": "Pick an account, or type the number from your bill if it isn't listed."
+          }
+        },
+        "reconfigure": {
+          "title": "Account settings",
+          "description": "Change this account's data source and rates.",
+          "data": {
+            "endpoint": "Data source",
+            "consumption_rate": "Water consumption rate ($ per 1000 L)",
+            "wastewater_rate": "Wastewater rate ($ per 1000 L)",
+            "wastewater_ratio": "Wastewater ratio",
+            "annual_line_charge": "Annual line charge ($)"
+          }
+        }
+      },
+      "error": {
+        "invalid_account_number": "Enter the account number as shown on your bill, e.g. 0012345-02.",
+        "account_already_configured": "This account is already set up."
+      },
+      "abort": {
+        "invalid_auth": "Watercare rejected the email or password.",
+        "cannot_connect": "Couldn't reach Watercare. Try again later.",
+        "unknown": "Unexpected error while signing in to Watercare. Check the logs for details.",
+        "already_configured": "This account is already set up.",
+        "no_unconfigured_accounts": "Every account on this login is already set up.",
+        "reconfigure_successful": "Account settings were updated."
+      }
+    }
+  }
+}

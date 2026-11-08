@@ -4,4 +4,10 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-python3 -m pip install --requirement requirements.txt
+# The devcontainer only provides Python; bootstrap uv from PyPI if it isn't
+# already installed.
+command -v uv >/dev/null || python3 -m pip install uv
+
+# Creates .venv and installs the default (dev) dependency group, which
+# includes the lint and test groups, exactly as pinned in uv.lock.
+uv sync --locked

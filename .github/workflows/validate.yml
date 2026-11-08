@@ -1,4 +1,4 @@
-name: "Validate"
+name: Validate
 
 on:
   workflow_dispatch:
@@ -6,32 +6,32 @@ on:
     - cron:  "0 0 * * *"
   push:
     branches:
-      - "main"
+      - main
   pull_request:
-    branches:
-      - "main"
+
+permissions: {}
 
 jobs:
   hassfest: # https://developers.home-assistant.io/blog/2020/04/16/hassfest
-    name: "Hassfest Validation"
-    runs-on: "ubuntu-latest"
+    name: Hassfest validation
+    runs-on: ubuntu-latest
     steps:
-        - name: "Checkout the repository"
-          uses: "actions/checkout@v4.1.0"
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-        - name: "Run hassfest validation"
-          uses: "home-assistant/actions/hassfest@master"
+      - name: Run hassfest validation
+        uses: home-assistant/actions/hassfest@f4ca6f671bd429efb108c0f2fa0ae8af0215986c # master
 
   hacs: # https://github.com/hacs/action
-    name: "HACS Validation"
-    runs-on: "ubuntu-latest"
+    name: HACS validation
+    runs-on: ubuntu-latest
     steps:
-        - name: "Checkout the repository"
-          uses: "actions/checkout@v4.1.0"
-
-        - name: "Run HACS validation"
-          uses: "hacs/action@main"
-          with:
-            category: "integration"
-            # Remove this 'ignore' key when you have added brand images for your integration to https://github.com/home-assistant/brands
-            #ignore: "brands"
+      - name: Run HACS validation
+        uses: hacs/action@d556e736723344f83838d08488c983a15381059a # 22.5.0
+        with:
+          category: integration
+          # Brand images already exist for this integration at home-assistant/brands,
+          # so the 'ignore: brands' escape hatch from the blueprint template is not needed.
+          # https://developers.home-assistant.io/docs/creating_integration_file_structure#local-brand-images-for-custom-integrations

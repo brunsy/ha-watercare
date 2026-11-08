@@ -27,14 +27,18 @@ You will need an existing Watercare account. Smart meter users have access to de
 
 ## Installation
 
-Once installed, set up from the `Devices and services` area with the following configuration:
+Once installed, set up from the `Devices and services` area. Setup has two steps:
 
-### Required Configuration
+### 1. Sign in
 
-- **Username**: Your Watercare account username
-- **Password**: Your Watercare account password
+- **Email**: The email you use to sign in to the Watercare mobile app
+- **Password**: Your Watercare mobile app password
 
-### Optional Configuration
+The credentials are checked before continuing.
+
+### 2. Add an account
+
+Pick one of the accounts on your login (shown with its property address), or type the account number from your bill if it isn't listed. Each account has its own settings:
 
 - **Data Source**: Choose the appropriate endpoint for your meter type (see Data Source Options above)
 - **Consumption Rate**: Cost per 1000L for water consumption (default: $2.296 NZD)
@@ -42,7 +46,15 @@ Once installed, set up from the `Devices and services` area with the following c
 - **Wastewater ratio**: Ratio of assumed wastewater usage by Watercare. Apartments are charged at 95 (default 0.785)
 - **Annual Fixed charge**: Annual fixed charge per meter (default: $332 NZD)
 
-The rates can be configured during initial setup or modified later through the integration's options.
+### More accounts and later changes
+
+- To track another property on the same login, open the integration and choose **Add account**. Each account gets its own sensor and statistics.
+- To change an account's data source or rates, use **Reconfigure** on that account.
+- To change the login's password, use **Reconfigure** on the integration itself. If Watercare rejects the saved credentials, Home Assistant prompts you to re-authenticate.
+
+### Upgrading from an earlier version
+
+An existing setup is converted automatically: its credentials stay on the integration and its data source and rates move onto an account. That account keeps the original `sensor.watercare` entity and statistic IDs, so existing history and Energy dashboard settings carry over. Accounts added afterwards get IDs that include the account number.
 
 ## Energy Dashboard Integration
 
@@ -69,8 +81,6 @@ Copy all files in the custom*components/watercare folder to your Home Assistant 
 ## Future enhancements
 
 Your support is welcomed.
-
-- Support for multiple properties/accounts
 
 ## Acknowledgements
 

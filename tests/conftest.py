@@ -1,0 +1,213 @@
+"""
+Shared fixtures for the watercare test suite.
+
+Avoids pulling in a full pytest-homeassistant-custom-component `hass`/recorder
+fixture: sensor.py and statistics_helpers.py only touch `hass` by passing it
+through to a handful of recorder functions imported by name
+(`async_add_external_statistics`, `get_last_statistics`, `get_instance`), so
+those are monkeypatched directly with in-memory fakes instead.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from custom_components.watercare import sensor as watercare_sensor
+from custom_components.watercare import statistics_helpers
+from custom_components.watercare.const import NZ_TIMEZONE
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def load_fixture(name: str) -> str:
+    """Return the raw text of a fixture file under tests/fixtures/."""
+    return (FIXTURES_DIR / name).read_text()
+
+
+def nz_timestamp_on(target_date: date, hour: int, minute: int = 0) -> str:
+    """Build a UTC API timestamp landing at `hour`:`minute` NZ time on `target_date`."""
+    nz_dt = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        hour,
+        minute,
+        0,
+        tzinfo=NZ_TIMEZONE,
+    )
+    return nz_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def nz_timestamp(days_ago: int, hour: int, minute: int = 0) -> str:
+    """
+    Build a UTC API timestamp landing `days_ago` days back at `hour`:`minute` NZ time.
+
+    Callers that also need the target date for an assertion should prefer
+    computing `datetime.now(NZ_TIMEZONE)` once themselves and passing the
+    derived date to nz_timestamp_on() directly -- a second, separate
+    `now()` call here vs. in the assertion could diverge across an NZ
+    midnight boundary.
+    """
+    target_date = (datetime.now(NZ_TIMEZONE) - timedelta(days=days_ago)).date()
+    return nz_timestamp_on(target_date, hour, minute)
+
+
+def nz_full_day_readings(
+    target_date: date, litres: dict[tuple[int, int], float] | None = None
+) -> list[dict[str, Any]]:
+    """
+    Build every half-hour reading of NZ `target_date`, as a fully published day.
+
+    Slots are zero-litre (as Watercare returns them) unless `litres` maps
+    their NZ (hour, minute) to a value. Steps through real UTC instants, so
+    a DST day gets its 46 or 50 slots.
+    """
+    litres = litres or {}
+    next_date = target_date + timedelta(days=1)
+    slot = datetime(
+        target_date.year, target_date.month, target_date.day, tzinfo=NZ_TIMEZONE
+    ).astimezone(UTC)
+    end = datetime(
+        next_date.year, next_date.month, next_date.day, tzinfo=NZ_TIMEZONE
+    ).astimezone(UTC)
+    readings = []
+    while slot < end:
+        nz_slot = slot.astimezone(NZ_TIMEZONE)
+        readings.append(
+            {
+                "timestamp": slot.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "litres": litres.get((nz_slot.hour, nz_slot.minute), 0),
+            }
+        )
+        slot += timedelta(minutes=30)
+    return readings
+
+
+class _FakeRecorderInstance:
+    async def async_add_executor_job(self, func: Callable, *args: Any) -> Any:
+        return func(*args)
+
+    async def async_block_till_done(self) -> None:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def patch_recorder(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """
+    Replace recorder/statistics calls with in-memory fakes.
+
+    Exposes `.written` (statistic_id -> list of StatisticData actually
+    pushed via async_add_external_statistics), `.last_statistics`
+    (statistic_id -> (sum, start_ts), settable per-test to simulate a single
+    existing watermark record), and `.stored_statistics` (statistic_id ->
+    list of (sum, start_ts), for tests simulating several already-stored
+    hours -- e.g. the healing window's anchor plus in-window hours. Takes
+    priority over `.last_statistics` when both are set for the same
+    statistic_id.
+    """
+    written: dict[str, list] = {}
+    last_statistics: dict[str, tuple[float, float]] = {}
+    stored_statistics: dict[str, list[tuple[float, float]]] = {}
+
+    def fake_get_last_statistics(
+        _hass: Any,
+        number: int,
+        statistic_id: str,
+        _convert_units: bool,  # noqa: FBT001
+        _types: set[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        if statistic_id in stored_statistics:
+            # Real get_last_statistics returns newest-first.
+            records = sorted(
+                stored_statistics[statistic_id], key=lambda r: r[1], reverse=True
+            )
+            return {
+                statistic_id: [
+                    {"sum": total, "start": start_ts}
+                    for total, start_ts in records[:number]
+                ]
+            }
+        if statistic_id not in last_statistics:
+            return {}
+        total, start_ts = last_statistics[statistic_id]
+        return {statistic_id: [{"sum": total, "start": start_ts}]}
+
+    def fake_async_add_external_statistics(
+        _hass: Any,
+        metadata: Any,
+        stats: list,
+    ) -> None:
+        # StatisticMetaData/StatisticData are TypedDicts (plain dicts at
+        # runtime), not objects -- index them, don't attribute-access them.
+        written.setdefault(metadata["statistic_id"], []).extend(stats)
+
+    monkeypatch.setattr(
+        watercare_sensor, "get_last_statistics", fake_get_last_statistics
+    )
+    monkeypatch.setattr(
+        statistics_helpers,
+        "async_add_external_statistics",
+        fake_async_add_external_statistics,
+    )
+    monkeypatch.setattr(
+        watercare_sensor, "get_instance", lambda _hass: _FakeRecorderInstance()
+    )
+
+    return SimpleNamespace(
+        written=written,
+        last_statistics=last_statistics,
+        stored_statistics=stored_statistics,
+    )
+
+
+@pytest.fixture
+def make_sensor() -> Callable[..., watercare_sensor.WatercareUsageSensor]:
+    """
+    Return a factory that builds a WatercareUsageSensor.
+
+    Constructs the sensor directly, bypassing entity-platform setup.
+    """
+
+    def _make(
+        endpoint: str = "halfhourly",
+        *,
+        consumption_rate: float = 2.296,
+        wastewater_rate: float = 3.994,
+        wastewater_ratio: float = 0.785,
+        annual_line_charge: float = 310,
+    ) -> watercare_sensor.WatercareUsageSensor:
+        sensor = watercare_sensor.WatercareUsageSensor(
+            "Watercare",
+            MagicMock(),
+            consumption_rate,
+            wastewater_rate,
+            wastewater_ratio,
+            annual_line_charge,
+            endpoint,
+            MagicMock(),
+            needs_backfill=False,
+        )
+        sensor.hass = MagicMock()
+        return sensor
+
+    return _make
+
+
+@pytest.fixture
+def load_json_fixture() -> Callable[[str], Any]:
+    """Return a callable that parses a fixture file's JSON content."""
+
+    def _load(name: str) -> Any:
+        return json.loads(load_fixture(name))
+
+    return _load

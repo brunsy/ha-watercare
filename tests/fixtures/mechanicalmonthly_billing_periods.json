@@ -1,0 +1,32 @@
+[
+  {
+    "billingPeriodFromDate": "2026-06-01T00:00:00.000Z",
+    "billingPeriodToDate": "2026-06-30T00:00:00.000Z",
+    "readingType": "Actual",
+    "waterUsage": 15000,
+    "accountBalance": -12.3,
+    "amountDue": 85.4,
+    "statistics": {
+      "dailyAverage": 500,
+      "efficiency": {
+        "currentHouseholdBand": 1,
+        "usageToLowerBand": 0
+      }
+    }
+  },
+  {
+    "billingPeriodFromDate": "2026-05-01T00:00:00.000Z",
+    "billingPeriodToDate": "2026-05-31T00:00:00.000Z",
+    "readingType": "Actual",
+    "waterUsage": 18000,
+    "accountBalance": -42.5,
+    "amountDue": 0,
+    "statistics": {
+      "dailyAverage": 580,
+      "efficiency": {
+        "currentHouseholdBand": 2,
+        "usageToLowerBand": 1200
+      }
+    }
+  }
+]
